@@ -28,7 +28,6 @@ the ability to predict nixtamaliation moisture content even earlier in the breed
 ## Directories:
 - scripts:
   - scripts used in the analysis for the publication
-- data:
-  - data collected from cook tests and NIR scanning, as well as environmental and genetic information
-- supplemental_materials:
-  - Additional materials to justify the findings of this project
+
+## Note:
+The data associated with this repository can be found in the manuscript associated with this repository and the manuscript at doi.org/10.1002/cche.10874
