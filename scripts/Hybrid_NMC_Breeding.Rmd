@@ -1,0 +1,2218 @@
+---
+title: "Application of CHIP-NMC to Breeding Contexts"
+author: "Michael Burns"
+date: '2024-12-04'
+output: html_document
+---
+
+A nixtamalization moisture content prediction application was developed recent (Burns et al., 2025). It was able to accurately predict the amount of moisture that maize kernels absorb during nixtamalization. Here, we will use the model to assess its utility in a breeding context. We will use predictions from this model to assess the relationship between inbreds and their hybrid progeny, effects of environment on multienvironment trials, the potential for genomic selection, and determine the genetic architecture in a hybrid system.
+
+# Libraries
+The first step is to load the libraries that will be needed
+```{r libraries, message = FALSE, warning = FALSE}
+library(multcompView)
+library(caret)
+library(prospectr)
+library(magrittr)
+library(lme4)
+library(slider)
+library(magrittr)
+library(tidyverse)
+library(ggpubr)
+library(envirotypeR)
+```
+
+# Load the Data
+```{r load data, message = FALSE, warning = FALSE}
+# Read in the hybrid spectra
+hybrid_spectra = read_csv('../Data/Hybrid_Maize_NIR_Spectra.csv') %>%
+  mutate(Genotype = toupper(Genotype))
+# Read in the hybrid nixtamalization moisture content predictions
+hybrid_nmc = read_csv('../Data/Hybrid_Maize_NIR_Spectra_hybrid_model_predictions.csv')
+# Check to make sure the list of samples are the same
+sum(hybrid_spectra$Sample_ID == hybrid_nmc$Sample_ID) == nrow(hybrid_spectra)
+
+# Read in the inbred spectra
+inbred_spectra = read_csv('../Data/WiDiv_Inbred_22_23_NIR_Data.csv') %>%
+  mutate(Genotype = toupper(Genotype))
+# Read in the inbred nixtamalization moisture content predictions
+inbred_nmc = read_csv('../Data/WiDiv_Inbred_22_23_NIR_Data_inbred_model_predictions.csv')
+# Check to make sure the list of samples are the same
+sum(inbred_spectra$Sample_ID == inbred_nmc$Sample_ID) == nrow(inbred_spectra)
+# They are not the same length because there were four extrapolated prediction - this is fine for how we will merge the datasets
+```
+
+# Merge the Data
+## Spectra and NMC
+```{r merge data, message = FALSE, warning = FALSE}
+# Merge the hybrid data
+hybrid_data = left_join(hybrid_spectra, hybrid_nmc, by = 'Sample_ID') %>%
+  distinct(Sample_ID, .keep_all = T)
+# Check if there are any missing values
+sum(is.na(hybrid_data$Predicted_Moisture_Content))
+
+# Merge the inbred data
+inbred_data = inner_join(inbred_spectra, inbred_nmc, by = 'Sample_ID') %>%
+  distinct(Sample_ID, .keep_all = T)
+# Check if there are any missing values
+sum(is.na(inbred_data$Predicted_Moisture_Content))
+
+# How many lines did we lose for each dataset?
+nrow(hybrid_spectra) - nrow(hybrid_data)
+nrow(inbred_spectra) - nrow(inbred_data)
+# Only 4 lines in the inbred data - not bad!
+```
+
+## Experiment Information
+### Widiv Field Book
+```{r read in field book, message = FALSE, warning = FALSE}
+widiv_plot_xref = read_csv('../Data/2022_2023_field_planning_widiv_xref.csv') %>%
+  filter(Source != 'Andy') %>%
+  select(Plot, Genotype, Block, Rep) %>%
+  mutate(Plot = toupper(Plot),
+         Genotype = toupper(Genotype))
+
+# Merge the hybrid data with the plot xref
+widiv_hybrid_data_field = right_join(widiv_plot_xref, hybrid_data, by = c('Plot' = 'Sample_ID', 'Genotype')) %>%
+  rename(Sample_ID = Plot) %>%
+  filter(str_detect(Sample_ID, '^YCH')) %>%
+  mutate(Year = as.factor(Year),
+         Rep = as.factor(Rep),
+         Block = as.factor(Block))
+```
+
+### Commercial Hybrids Field Book
+```{r read in ch field book, message = FALSE, warning = FALSE}
+ch_field_data = read_csv('../Data/CH_22_23_Harvest_Data.csv') %>%
+  select(Sample_ID, Year, Genotype, Location, Rep)
+```
+
+### ERA Hybrids Field Book
+```{r read in era field book, message = FALSE, warning = FALSE}
+era_field_data = read_csv('../Data/ERA_22_23_Harvest_Data.csv') %>%
+  select(Sample_ID, Year, Genotype, Location, Rep, Block)
+```
+
+# Assess Proportion of Variance Explained
+## Visualize NMC Data for each Experiment
+```{r visualize nmc data, message = FALSE, warning = FALSE}
+hybrid_data_combined = hybrid_data %>%
+  filter(Experiment %in% c('WiDiv - Hybrids', 'Era Hybrids', 'Commercial Hybrids')) %>%
+  mutate(Experiment = case_when(Experiment == 'WiDiv - Hybrids' ~ 'Wisconsin Diversity Panel Hybrids',
+                                Experiment == 'Era Hybrids' ~ 'Historical Hybrids',
+                                Experiment == 'Commercial Hybrids' ~ 'Commercial Hybrids')) %>%
+  mutate(Year = as.factor(Year),
+         Experiment = factor(Experiment, levels = c('Wisconsin Diversity Panel Hybrids',
+                                                    'Commercial Hybrids',
+                                                    'Historical Hybrids')))
+
+hybrid_data_combined %>%
+  select(Sample_ID, Predicted_Moisture_Content, Experiment, Year) %>%
+  group_by(Experiment) %>%
+  summarize(mean_nmc = mean(Predicted_Moisture_Content),
+            min_nmc = min(Predicted_Moisture_Content),
+            max_nmc = max(Predicted_Moisture_Content))
+
+hybrid_data_combined %>%
+  select(Sample_ID, Predicted_Moisture_Content, Experiment, Year) %>%
+  group_by(Experiment, Year) %>%
+  summarize(mean_nmc = mean(Predicted_Moisture_Content)) %>%
+  pivot_wider(names_from = Year, values_from = mean_nmc) %>%
+  mutate(diff = `2022` - `2023`) %>%
+  ungroup() %>%
+  summarise(mean_diff = mean(diff),
+            min_diff = min(diff),
+            max_diff = max(diff))
+
+nmc_distribution_plot = hybrid_data_combined %>%
+  select(Sample_ID, Predicted_Moisture_Content, Experiment, Year) %>%
+  # bind_rows(hybrid_data_combined %>%
+  #             select(Sample_ID, Predicted_Moisture_Content, Experiment, Year) %>%
+  #             mutate(Year = 'Overall')) %>%
+  ggplot(aes(x = Predicted_Moisture_Content, fill = factor(Year)))+
+  geom_density(alpha = 0.5)+
+  facet_wrap(~Experiment)+
+  scale_fill_manual(values = c('2022' = 'darkred',
+                               '2023' = 'darkblue'#,
+                               #'Overall' = 'gray'
+                               ))+
+  labs(x = 'Nixtamalization Moisture Content',
+       fill = 'Year',
+       tag = 'A')+
+  theme_classic()+
+  theme(legend.position = 'bottom',
+        text = element_text(size = 12, color = 'black'))
+
+nmc_distribution_plot
+
+ggsave('../Outputs/nmc_distribution_plot.png',
+       nmc_distribution_plot,
+       width = 7.5,
+       height = 2.5,
+       dpi = 300)
+```
+
+The predicted moisture content is quite different across years, so we will need to do our analyses separately across years.
+
+## Variance Explained - Entire Dataset
+```{r variance explained, message = FALSE, warning = FALSE}
+# WiDiv
+widiv_mlm = lmer(Predicted_Moisture_Content ~ (1|Genotype) + (1|Genotype:Year) + (1|Year/Rep/Block),
+                 data = widiv_hybrid_data_field)
+
+# Commercial Hybrids
+ch_mlm = lmer(Predicted_Moisture_Content ~ (1|Genotype) + (1|Location) + (1|Genotype:Location) + (1|Genotype:Year) + (1|Year/Location/Rep),
+              data = ch_field_data %>%
+                left_join(hybrid_nmc, by = c('Sample_ID' = 'Sample_ID')) %>%
+                filter(!is.na(Predicted_Moisture_Content)))
+
+# ERA Hybrids
+era_mlm = lmer(Predicted_Moisture_Content ~ (1|Genotype) + (1|Location) + (1|Genotype:Location) + (1|Genotype:Year) + (1|Year/Location/Rep),
+               data = era_field_data %>%
+                 left_join(hybrid_nmc, by = c('Sample_ID' = 'Sample_ID')) %>%
+                 filter(!is.na(Predicted_Moisture_Content)))
+
+# Extract the variance components
+overall_pve_data = summary(widiv_mlm)$varcor %>%
+  as_tibble() %>%
+  mutate(Total_SS = sum(vcov),
+  PVE = vcov / Total_SS) %>%
+  mutate(Experiment = 'Wisconsin Diversity Panel Hybrids') %>%
+  select(Experiment, grp, PVE) %>%
+  bind_rows(summary(ch_mlm)$varcor %>%
+              as_tibble() %>%
+              mutate(Total_SS = sum(vcov),
+                     PVE = vcov / Total_SS) %>%
+              mutate(Experiment = 'Commercial Hybrids') %>%
+              select(Experiment, grp, PVE) %>%
+              bind_rows(summary(era_mlm)$varcor %>%
+                          as_tibble() %>%
+                          mutate(Total_SS = sum(vcov),
+                                 PVE = vcov / Total_SS) %>%
+                          mutate(Experiment = 'Historical Hybrids') %>%
+                          select(Experiment, grp, PVE)))
+
+overall_pve_data %>%
+  ggplot(aes(x = grp, y = PVE))+
+  geom_bar(stat = 'identity')+
+  coord_flip()+
+  labs(x = 'Variance Component', y = 'Proportion of Variance Explained')+
+  facet_wrap(~Experiment)+
+  theme_classic()
+```
+
+It looks like the Year effect is very prevalent in the CH and ERA samples specifically, but also it is the number one source of variation in WiDiv. Because of this, we are going to split analyses by year to account for this discrepancy.
+
+## Variance Explained - Split by Year
+```{r variance explained split by year, message = FALSE, warning = FALSE}
+# WiDiv
+widiv_mlm_2022 = lmer(Predicted_Moisture_Content ~ (1|Genotype) + (1|Rep/Block),
+                      data = widiv_hybrid_data_field %>%
+                        filter(Year == 2022))
+
+widiv_mlm_2023 = lmer(Predicted_Moisture_Content ~ (1|Genotype) + (1|Rep/Block),
+                      data = widiv_hybrid_data_field %>%
+                        filter(Year == 2023))
+
+# Commercial Hybrids
+ch_mlm_2022 = lmer(Predicted_Moisture_Content ~ (1|Genotype) + (1|Genotype:Location) + (1|Location/Rep),
+                    data = ch_field_data %>%
+                      left_join(hybrid_nmc, by = c('Sample_ID' = 'Sample_ID')) %>%
+                      filter(!is.na(Predicted_Moisture_Content),
+                             Year == 2022))
+
+ch_mlm_2023 = lmer(Predicted_Moisture_Content ~ (1|Genotype) + (1|Genotype:Location) + (1|Location/Rep),
+                    data = ch_field_data %>%
+                      left_join(hybrid_nmc, by = c('Sample_ID' = 'Sample_ID')) %>%
+                      filter(!is.na(Predicted_Moisture_Content),
+                             Year == 2023))
+
+# ERA Hybrids
+era_mlm_2022 = lmer(Predicted_Moisture_Content ~ (1|Genotype) + (1|Genotype:Location) + (1|Location/Rep),
+                     data = era_field_data %>%
+                       left_join(hybrid_nmc, by = c('Sample_ID' = 'Sample_ID')) %>%
+                       filter(!is.na(Predicted_Moisture_Content),
+                              Year == 2022))
+
+era_mlm_2023 = lmer(Predicted_Moisture_Content ~ (1|Genotype) + (1|Rep),
+                     data = era_field_data %>%
+                       left_join(hybrid_nmc, by = c('Sample_ID' = 'Sample_ID')) %>%
+                       filter(!is.na(Predicted_Moisture_Content),
+                              Year == 2023))
+
+# Extract the variance components
+yearly_pve_data = summary(widiv_mlm_2022)$varcor %>%
+  as_tibble() %>%
+  mutate(Total_SS = sum(vcov),
+         PVE = vcov / Total_SS) %>%
+  mutate(Experiment = 'Wisconsin Diversity Panel Hybrids',
+         Year = '2022') %>%
+  select(Experiment, Year, grp, PVE) %>%
+  bind_rows(summary(widiv_mlm_2023)$varcor %>%
+              as_tibble() %>%
+              mutate(Total_SS = sum(vcov),
+                     PVE = vcov / Total_SS) %>%
+              mutate(Experiment = 'Wisconsin Diversity Panel Hybrids',
+                     Year = '2023') %>%
+              select(Experiment, Year, grp, PVE)) %>%
+  bind_rows(summary(ch_mlm_2022)$varcor %>%
+              as_tibble() %>%
+              mutate(Total_SS = sum(vcov),
+                     PVE = vcov / Total_SS) %>%
+              mutate(Experiment = 'Commercial Hybrids',
+                     Year = '2022') %>%
+              select(Experiment, Year, grp, PVE)) %>%
+  bind_rows(summary(ch_mlm_2023)$varcor %>%
+              as_tibble() %>%
+              mutate(Total_SS = sum(vcov),
+                     PVE = vcov / Total_SS) %>%
+              mutate(Experiment = 'Commercial Hybrids',
+                     Year = '2023') %>%
+              select(Experiment, Year, grp, PVE)) %>%
+  bind_rows(summary(era_mlm_2022)$varcor %>%
+              as_tibble() %>%
+              mutate(Total_SS = sum(vcov),
+                     PVE = vcov / Total_SS) %>%
+              mutate(Experiment = 'Historical Hybrids',
+                     Year = '2022') %>%
+              select(Experiment, Year, grp, PVE)) %>%
+  bind_rows(summary(era_mlm_2023)$varcor %>%
+              as_tibble() %>%
+              mutate(Total_SS = sum(vcov),
+                     PVE = vcov / Total_SS) %>%
+              mutate(Experiment = 'Historical Hybrids',
+                     Year = '2023') %>%
+              select(Experiment, Year, grp, PVE))
+
+yearly_pve_data %>%
+  ggplot(aes(x = grp, y = PVE))+
+  geom_bar(stat = 'identity')+
+  coord_flip()+
+  facet_wrap(Year~Experiment)+
+  theme_classic()
+```
+
+Genotype explains a significant amount of variation in most of these instances (CH is pretty low, but still notable at just under 20%). This justifies further exploration into the genetic architechure of the NMC trait in hybrids. How does it relate to yield? How do hybrids relate to their inbred parents? Can genomic prediction be used to predict NMC? Are there additive or dominance markers that can be utilized?
+
+## Combined PVE Plot
+```{r combined pve plot, message = FALSE, warning = FALSE}
+overall_pve_plot = overall_pve_data %>%
+  mutate(Year = 'Overall') %>%
+  bind_rows(yearly_pve_data) %>%
+  mutate(grp = case_when(str_detect(grp, 'Block') ~ 'Other',
+                         str_detect(grp, 'Rep') ~ 'Other',
+                         str_detect(grp, 'Location:Year') ~ 'Other',
+                         T ~ grp)) %>%
+  mutate(grp = factor(grp, levels = c('Genotype', 'Location', 'Year', 'Genotype:Location', 'Genotype:Year', 'Location:Year', 'Other', 'Residual')),
+         Experiment = factor(Experiment, levels = c('Wisconsin Diversity Panel Hybrids',
+                                                    'Commercial Hybrids',
+                                                    'Historical Hybrids')),
+         Year = factor(Year, levels = c('Overall', '2022', '2023'))) %>%
+  ggplot(aes(x = Year, y = PVE, fill = grp))+
+  geom_bar(stat = 'identity')+
+  facet_wrap(~Experiment)+
+  scale_fill_manual(values = c('Genotype' = '#35827F',
+                                'Location' = '#533747',
+                                'Year' = '#F9DB6D',
+                                'Genotype:Location' = '#E5446D',
+                                'Genotype:Year' = '#FFA69E',
+                                'Location:Year' = '#E88873',
+                                'Other' = 'gray70',
+                                'Residual' = 'gray30'))+
+  labs(x = 'Model Type',
+       y = 'Proportion of Variance Explained',
+       fill = 'Variance Component',
+       tag = 'B')+
+  theme_classic()+
+  theme(legend.position = 'bottom',
+        text = element_text(size = 12, color = 'black'))
+
+overall_pve_plot
+
+ggsave('../Outputs/overall_pve_plot.png',
+       overall_pve_plot,
+       width = 7.5,
+       height = 3.5,
+       dpi = 300)
+```
+
+
+# Relationship between NMC and Yield
+## Prepare Yield Data
+### Read in and visualize data
+#### WiDiv Harvest
+```{r read in harvest data, message = FALSE, warning = FALSE}
+widiv_stand_counts = read_csv('../Data/2022_2023_widiv_stand_counts.csv') %>%
+  mutate(Sample_ID = toupper(Sample_ID))
+
+widiv_harvest_data = read_csv('../Data/2022_2023_widiv_harvest.csv') %>%
+  mutate(Sample_ID = toupper(Sample_ID)) %>%
+  mutate(Plants_Harvested = case_when(is.na(Plants_Harvested) ~ 10,
+                                       !is.na(Plants_Harvested) ~ Plants_Harvested),
+         Moisture = as.numeric(Moisture),
+         Total_Weight = as.numeric(Total_Weight),
+         Cob_Weight = as.numeric(Cob_Weight),
+         Test_Weight = as.numeric(Test_Weight)) %>%
+  filter(!is.na(Moisture),
+         !is.na(Total_Weight),
+         !is.na(Cob_Weight),
+         Cob_Weight < Total_Weight,
+         Plants_Harvested == 10) %>%
+  select(-notes, - Plants_Harvested) %>%
+  left_join(widiv_stand_counts)
+
+summary(widiv_harvest_data)
+
+widiv_harvest_data_long = widiv_harvest_data %>%
+  pivot_longer(cols = c(Total_Weight, Cob_Weight, Moisture, Test_Weight),
+               names_to = 'Measure',
+               values_to = 'Value')
+
+widiv_harvest_data_long %>%
+  ggplot(aes(x = Value))+
+  geom_histogram()+
+  facet_wrap(~Measure, scales = 'free')+
+  theme_classic()
+
+widiv_harvest_data_long %>%
+  ggplot(aes(x = Measure, y = Value))+
+  geom_boxplot()+
+  facet_wrap(~Measure, scales = 'free')+
+  theme_classic()
+
+widiv_stand_counts %>%
+  mutate(Group = case_when(str_detect(Sample_ID, 'H') ~ 'Hybrid',
+                           !str_detect(Sample_ID, 'H') ~ 'Inbred')) %>%
+  ggplot(aes(x = Stand_Count, fill = Group))+
+  geom_histogram(alpha = 0.5, )+
+  theme_classic()
+```
+
+#### Commercial Hybrid Harvest
+```{r CH sample harvest data, message = FALSE, warning = FALSE}
+ch_harvest_data = read_csv('../Data/CH_22_23_Harvest_Data.csv') %>%
+  mutate(Harvested_Rows = case_when(Location == 'Saint Paul' & Year == 2023 ~ 2,
+                                    Location == 'Saint Paul' & Year == 2022 ~ 4,
+                                   T ~ Rows_Per_Plot),
+         plot_width = Row_Spacing * Harvested_Rows / 12,
+         plot_area = Plot_Length * plot_width / 43560,
+         .before = Stand_Count) %>%
+  filter(Stand_Count > 25 | Location == "Lamberton") %>%
+  mutate(Year = as.factor(Year),
+         Location = as.factor(Location),
+         Rep = as.factor(Rep),
+         Block = as.factor(Block))
+
+ch_harvest_data %>%
+  ggplot(aes(x = Stand_Count / (Seed_Per_Plot*Harvested_Rows), fill = Location))+
+  geom_histogram(alpha = 0.5)+
+  theme_classic()
+```
+
+This plot is a mess because of how stand counts were taken in 2022 and 2023.
+
+#### ERA Hybrid Harvest
+```{r ERA sample harvest data, message = FALSE, warning = FALSE}
+era_harvest_data = read_csv('../Data/ERA_22_23_Harvest_Data.csv') %>%
+  mutate(Rows_Per_Plot = case_when(Location == 'Saint Paul' ~ 2,
+                                   T ~ Rows_Per_Plot),
+         plot_width = Row_Spacing * Rows_Per_Plot / 12,
+         plot_area = Plot_Length * plot_width / 43560,
+         .before = Stand_Count) %>%
+  filter(Stand_Count / (Seed_Per_Plot*Rows_Per_Plot) > 0.75) %>%
+  mutate(Year = as.factor(Year),
+         Location = as.factor(Location),
+         Rep = as.factor(Rep),
+         Block = as.factor(Block))
+
+era_harvest_data %>%
+  ggplot(aes(x = Stand_Count / (Seed_Per_Plot*Rows_Per_Plot), fill = Location))+
+  geom_histogram(alpha = 0.5)+
+  theme_classic()
+```
+
+### Calculate Yield
+#### WiDiv Yield
+```{r widiv yield calculations}
+widiv_yield_data = widiv_harvest_data %>%
+  mutate(Dry_Matter_Proportion = 1 - (Moisture / 100), # Remove Moisture
+         Grain_Weight = (Total_Weight - Cob_Weight) * 0.00220462, # Determine grain mass and convert to pounds right away
+         Dry_Matter_Pounds = Grain_Weight * Dry_Matter_Proportion, # Determine dry grain material
+         Grain_Weight_at_15.5 = Dry_Matter_Pounds / 0.845, # Determine mass at specific moisture content
+         Bushels = Grain_Weight_at_15.5 / 56, # Calculate bushels per plot (pounds of grain / pounds per bushel)
+         Yield = ((Bushels / 10) * (Stand_Count / ((15 * 2.5) / 43560))) / 14.87) # Adjust bushels for planting density per acre (about 31000 with 27 plants planted per 15 row 30 inch spaced plot) and convert to tons per hectare (14.87 b/a = 1 t/ha)
+
+widiv_yield_data %>%
+  mutate(Group = case_when(str_detect(Sample_ID, 'H') ~ 'Hybrid',
+                           !str_detect(Sample_ID, 'H') ~ 'Inbred')) %>%
+  ggplot(aes(x = Yield, fill = Group))+
+  geom_density(alpha = 0.5)+
+  xlim(0,25)+
+  theme_classic()
+```
+
+Hybrids are generally yielding more than inbreds - this is a good sign!
+
+##### Spatial Visualization of Yield
+```{r spatial visualzation}
+widiv_field_plan = read_csv('../Data/widiv_inbred_hybrid_trials_2022_2023_field_plan.csv') %>%
+  pivot_longer(cols = -c(Year, Field, Range),
+               names_to = 'Row',
+               values_to = 'Sample_ID') %>%
+  mutate(Sample_ID = toupper(Sample_ID)) %>%
+  mutate(Range = as.numeric(Range),
+         Row = as.numeric(Row)) %>%
+  filter(str_detect(Sample_ID, '^YC')) # Remove stragglers that were filling space
+
+widiv_yield_data_full = widiv_field_plan %>%
+  left_join(widiv_yield_data) %>%
+  left_join(widiv_plot_xref, by = c('Sample_ID' = 'Plot')) %>%
+  left_join(widiv_stand_counts) %>%
+  filter(!is.na(Rep)) %>%
+  mutate(Group = case_when(str_detect(Sample_ID, 'H') ~ 'Hybrid',
+                           !str_detect(Sample_ID, 'H') ~ 'Inbred')) %>%
+  group_by(Genotype) %>%
+  mutate(is_check = case_when(n() > 5 ~ 1,
+                              n() < 5 ~ 0)) %>%
+  ungroup() %>%
+  mutate(is_check = as.factor(is_check)) %>%
+  filter(Group == 'Hybrid',
+         Stand_Count > 20)
+
+widiv_yield_data_full %>%
+  ggplot(aes(x = Row, y = Range, fill = Yield, color = Yield))+
+  geom_tile()+
+  #scale_y_continuous(limits = c(26,52), expand = c(0, 0)) +
+  #scale_x_continuous(limits = c(2,50), expand = c(0, 0)) +
+  facet_wrap(~Field)+
+  theme_classic()
+
+widiv_yield_data_full %>%
+  filter(is_check == 1) %>%
+  ggplot(aes(x = Row, y = Range, fill = Yield, color = Yield))+
+  geom_tile()+
+  #scale_y_continuous(limits = c(26,52), expand = c(0, 0)) +
+  #scale_x_continuous(limits = c(2,50), expand = c(0, 0)) +
+  facet_wrap(~Field)+
+  theme_classic()
+```
+
+#### Commerical Hybrid Yield
+```{r CH yield calculations}
+ch_yield_data = ch_harvest_data %>%
+  mutate(Yield = case_when(is.na(Yield) ~ (((Plot_Weight * ((100-Grain_Moisture) / (100 - 15.5))) / plot_area) / 56) / 14.87,
+                           T ~ Yield / 14.87))
+
+ch_yield_data %>%
+  ggplot(aes(x = Yield, fill = Location))+
+  geom_density(alpha = 0.5)+
+  theme_classic()
+```
+
+#### ERA Hybrid Yield
+```{r ERA yield calculations}
+era_yield_data = era_harvest_data %>%
+  mutate(Yield = case_when(is.na(Yield) ~ (((Plot_Weight * ((100-Grain_Moisture) / (100 - 15.5))) / plot_area) / 56) / 14.87,
+                           T ~ Yield / 14.87))
+
+era_yield_data %>%
+  ggplot(aes(x = Yield, fill = Location))+
+  geom_density(alpha = 0.5)+
+  theme_classic()
+```
+
+### Correcting Yield for Spatial Effects
+WiDiv is a very large experiment so we are going to correct for field spatial variation. This is less of a concern for ERA and CH as they are smaller experiments spatially.
+
+```{r yield correction}
+rep_block_effects = widiv_yield_data_full %>%
+  filter(is_check == 1) %>%
+  group_by(Genotype, Rep, Block, Year) %>%
+  summarise(mean_yield = mean(Yield)) %>%
+  group_by(Genotype) %>%
+  mutate(geno_yield = mean(mean_yield),
+         yield_diff = mean_yield - geno_yield) %>%
+  group_by(Rep, Block, Year) %>%
+  summarise(yield_correction = mean(yield_diff))
+
+rep_block_effects
+
+corrected_widiv_yields = widiv_yield_data_full %>%
+  left_join(rep_block_effects) %>%
+  mutate(Corrected_Yield = Yield - yield_correction)
+
+corrected_widiv_yields %>%
+  filter(is_check == 1) %>%
+  group_by(Genotype, Rep, Block, Year) %>%
+  summarise(mean_yield = mean(Corrected_Yield)) %>%
+  group_by(Genotype, Year) %>%
+  mutate(geno_yield = mean(mean_yield),
+         yield_diff = mean_yield - geno_yield) %>%
+  group_by(Rep, Block, Year) %>%
+  summarise(yield_correction = mean(yield_diff))
+```
+
+The yields have been corrected, lets check to see what the map looks like now.
+```{r corrected yield spatial visualization}
+corrected_widiv_yields %>%
+  ggplot(aes(x = Row, y = Range, fill = Corrected_Yield, color = Corrected_Yield))+
+  geom_tile()+
+  #scale_y_continuous(limits = c(26,52), expand = c(0, 0)) +
+  #scale_x_continuous(limits = c(2,50), expand = c(0, 0)) +
+  facet_wrap(~Field)+
+  theme_classic()
+```
+
+### Yield BLUEs
+#### Calculate WiDiv Yield BLUEs
+```{r calculating blues for yield, message = FALSE, warning = FALSE}}
+widiv_yield_data = corrected_widiv_yields %>%
+  filter(!str_detect(Genotype, 'X LH244$')) %>% # Remove top crosses to LH244 as this was only done for 2023
+  select(Sample_ID, Block, Rep, Year, Corrected_Yield, Genotype) %>%
+  filter(!is.na(Corrected_Yield)) %>%
+  mutate(Genotype = toupper(Genotype)) %>%
+  mutate(Year = as.factor(Year),
+         Block = as.factor(Block),
+         Rep = as.factor(Rep))
+
+yield_2022_blues = fixef(lmer(Corrected_Yield ~ Genotype + (1|Rep/Block), data = widiv_yield_data[widiv_yield_data$Year == '2022',])) %>%
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)')
+
+yield_2023_blues = fixef(lmer(Corrected_Yield ~ Genotype + (1|Rep/Block), data = widiv_yield_data[widiv_yield_data$Year == '2023',])) %>%
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)')
+
+widiv_yield_blues = yield_2022_blues %>%
+  mutate(Year = 2022) %>%
+  bind_rows(yield_2023_blues %>%
+              mutate(Year = 2023))
+
+plot(lmer(Corrected_Yield ~ Genotype + (1|Rep/Block), data = widiv_yield_data[widiv_yield_data$Year == '2022',]))
+plot(lmer(Corrected_Yield ~ Genotype + (1|Rep/Block), data = widiv_yield_data[widiv_yield_data$Year == '2023',]))
+```
+
+#### Calculate CH Yield BLUEs
+```{r CH yield blues}
+yield_2022_blues = fixef(lmer(Yield ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep), data = ch_yield_data[ch_yield_data$Year == '2022',])) %>%
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)')
+
+yield_2023_blues = fixef(lmer(Yield ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep), data = ch_yield_data[ch_yield_data$Year == '2023',])) %>%
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)')
+
+ch_yield_blues = yield_2022_blues %>%
+  mutate(Year = 2022) %>%
+  bind_rows(yield_2023_blues %>%
+              mutate(Year = 2023))
+
+plot(lmer(Yield ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep), data = ch_yield_data[ch_yield_data$Year == '2022',]))
+plot(lmer(Yield ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep), data = ch_yield_data[ch_yield_data$Year == '2023',]))
+```
+
+#### Calculate ERA Yield BLUEs
+```{r ERA yield blues}
+yield_2022_blues = fixef(lmer(Yield ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep) + (1|Block), data = era_yield_data[era_yield_data$Year == '2022',])) %>%
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)')
+
+yield_2023_blues = fixef(lmer(Yield ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep) + (1|Block), data = era_yield_data[era_yield_data$Year == '2023',])) %>% 
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)')
+
+era_yield_blues = yield_2022_blues %>%
+  mutate(Year = 2022) %>%
+  bind_rows(yield_2023_blues %>%
+              mutate(Year = 2023))
+
+plot(lmer(Yield ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep) + (1|Block), data = era_yield_data[era_yield_data$Year == '2022',]))
+plot(lmer(Yield ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep) + (1|Block), data = era_yield_data[era_yield_data$Year == '2023',]))
+```
+
+### Determine NMC BLUEs
+#### Calculate WiDiv NMC BLUEs
+```{r create the hybrid mixed linear models, message = FALSE, warning = FALSE}
+mc_2022 = widiv_hybrid_data_field %>%
+  filter(Year == 2022) %>%
+  select(Genotype, Predicted_Moisture_Content, Block, Rep) %>%
+  mutate(Rep = as.factor(Rep),
+         Block = as.factor(Block))
+
+hybrid_blues_2022 = fixef(lmer(Predicted_Moisture_Content ~ Genotype + (1|Rep/Block), data = mc_2022)) %>%
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)') %>%
+  separate(Genotype, into = c('egg_parent', 'pollen_parent'), sep = ' X ') %>%
+  mutate(Genotype = paste0(egg_parent, ' X ', pollen_parent))
+
+mc_2023 = widiv_hybrid_data_field %>%
+  filter(Year == 2023) %>%
+  select(Genotype, Predicted_Moisture_Content, Block, Rep) %>%
+  mutate(Rep = as.factor(Rep),
+         Block = as.factor(Block))
+
+hybrid_blues_2023 = fixef(lmer(Predicted_Moisture_Content ~ Genotype + (1|Rep/Block), data = mc_2023)) %>%
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)') %>%
+  separate(Genotype, into = c('egg_parent', 'pollen_parent'), sep = ' X ') %>%
+  mutate(Genotype = paste0(egg_parent, ' X ', pollen_parent))
+
+hybrid_blues = hybrid_blues_2022 %>%
+  mutate(Year = 2022) %>%
+  bind_rows(hybrid_blues_2023 %>%
+              mutate(Year = 2023))
+
+plot(lmer(Predicted_Moisture_Content ~ Genotype + (1|Rep/Block), data = mc_2022))
+plot(lmer(Predicted_Moisture_Content ~ Genotype + (1|Rep/Block), data = mc_2023))
+```
+
+It looks like the residuals are mostly normal - great!
+
+#### Calculate CH NMC BLUEs
+```{r CH nmc blues}
+mc_2022 = ch_harvest_data %>%
+  filter(Year == 2022) %>%
+  select(Sample_ID, Genotype, Location, Rep) %>%
+  left_join(hybrid_nmc, by = c('Sample_ID')) %>%
+  mutate(Rep = as.factor(Rep))
+
+ch_blues_2022 = fixef(lmer(Predicted_Moisture_Content ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep), data = mc_2022)) %>%
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)')
+
+mc_2023 = ch_harvest_data %>%
+  filter(Year == 2023) %>%
+  select(Sample_ID, Genotype, Location, Rep) %>%
+  left_join(hybrid_nmc, by = c('Sample_ID')) %>%
+  mutate(Rep = as.factor(Rep))
+
+ch_blues_2023 = fixef(lmer(Predicted_Moisture_Content ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep), data = mc_2023)) %>%
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)')
+
+ch_blues = ch_blues_2022 %>%
+  mutate(Year = 2022) %>%
+  bind_rows(ch_blues_2023 %>%
+              mutate(Year = 2023))
+
+plot(lmer(Predicted_Moisture_Content ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep), data = mc_2022))
+plot(lmer(Predicted_Moisture_Content ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep), data = mc_2023))
+```
+
+#### Calculate ERA NMC BLUEs
+```{r ERA nmc blues}
+mc_2022 = era_harvest_data %>%
+  filter(Year == 2022) %>%
+  select(Sample_ID, Genotype, Location, Rep, Block) %>%
+  left_join(hybrid_nmc, by = c('Sample_ID')) %>%
+  mutate(Rep = as.factor(Rep),
+         Block = as.factor(Block))
+
+era_blues_2022 = fixef(lmer(Predicted_Moisture_Content ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep) + (1|Block), data = mc_2022)) %>%
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)')
+
+mc_2023 = era_harvest_data %>%
+  filter(Year == 2023) %>%
+  select(Sample_ID, Genotype, Location, Rep, Block) %>%
+  left_join(hybrid_nmc, by = c('Sample_ID')) %>%
+  mutate(Rep = as.factor(Rep),
+         Block = as.factor(Block)) %>%
+  filter(!is.na(Predicted_Moisture_Content),
+         Rep != '10', # only one instance which is a no-no for mlms
+         Block != '2') # only one instance which is a no-no for mlms
+
+era_blues_2023 = fixef(lmer(Predicted_Moisture_Content ~ Genotype + (1|Genotype) + (1|Rep) + (1|Block), data = mc_2023)) %>% # We did not get seed from waseca to scan in 2023
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)')
+
+era_blues = era_blues_2022 %>%
+  mutate(Year = 2022) %>%
+  bind_rows(era_blues_2023 %>%
+              mutate(Year = 2023))
+
+plot(lmer(Predicted_Moisture_Content ~ Genotype + (1|Location) + (1|Genotype:Location) + (1|Rep) + (1|Block), data = mc_2022))
+plot(lmer(Predicted_Moisture_Content ~ Genotype + (1|Genotype) + (1|Rep) + (1|Block), data = mc_2023))
+```
+
+## Assess Relationship between NMC and Yield
+### Visualize the Data
+```{r visualize the data, message = FALSE, warning = FALSE}
+yield_nmc_plot = widiv_yield_blues %>%
+  rename(Yield_BLUE = BLUE) %>%
+  left_join(hybrid_blues %>%
+              rename(NMC_BLUE = BLUE) %>%
+              select(Genotype, Year, NMC_BLUE),
+            by = c('Genotype', 'Year')) %>%
+  mutate(Experiment = 'Wisconsin Diversity Panel Hybrids') %>%
+  bind_rows(ch_yield_blues %>%
+              rename(Yield_BLUE = BLUE) %>%
+              left_join(ch_blues %>%
+                          rename(NMC_BLUE = BLUE) %>%
+                          select(Genotype, Year, NMC_BLUE),
+                        by = c('Genotype', 'Year')) %>%
+              mutate(Experiment = 'Commercial Hybrids')) %>%
+  bind_rows(era_yield_blues %>%
+              rename(Yield_BLUE = BLUE) %>%
+              left_join(era_blues %>%
+                          rename(NMC_BLUE = BLUE) %>%
+                          select(Genotype, Year, NMC_BLUE),
+                        by = c('Genotype', 'Year')) %>%
+              mutate(Experiment = 'Historical Hybrids')) %>%
+  mutate(Year = as.factor(Year),
+         Experiment = factor(Experiment, levels = c('Wisconsin Diversity Panel Hybrids',
+                                                    'Commercial Hybrids',
+                                                    'Historical Hybrids'))) %>%
+  ggplot(aes(x = Yield_BLUE, y = NMC_BLUE, color = Year))+
+  geom_point(alpha = 0.5)+
+  geom_smooth(se = F, method = 'lm')+
+  stat_cor(show.legend = F, )+
+  labs(x = 'Yield BLUE',
+       y = 'Nixtamalization Moisture\nContent BLUE',
+       color = 'Year')+
+  facet_wrap(~Experiment, scales = 'free_x')+
+  scale_color_manual(values = c('2022' = 'darkred', '2023' = 'darkblue'))+
+  ylim(0.4,0.475)+
+  theme_classic()+
+  theme(legend.position = 'bottom',
+        text = element_text(size = 12, color = 'black'))
+
+yield_nmc_plot
+
+ggsave('../Outputs/yield_nmc_plot.png',
+       yield_nmc_plot,
+       width = 7.5,
+       height = 3.5,
+       units = 'in',
+       dpi = 300)
+
+```
+
+# Assess the Relationship Between Inbreds and Their Hybrid Progeny
+## Load inbred data
+```{r read in inbred data}
+inbred_data_field = right_join(widiv_plot_xref, inbred_data, by = c('Plot' = 'Sample_ID', 'Genotype')) %>%
+  rename(Sample_ID = Plot) %>%
+  filter(str_detect(Sample_ID, '^YC2')) %>%
+  mutate(Year = case_when(str_detect(Sample_ID, 'YC22') ~ 2022,
+                          str_detect(Sample_ID, 'YC23') ~ 2023)) %>%
+  mutate(Year = as.factor(Year),
+         Rep = as.factor(Rep),
+         Block = as.factor(Block))
+```
+
+## Visualize the data
+```{r visualize the data, message = FALSE, warning = FALSE}
+# Plot nixtamalization moisture content of inbreds and hybrids
+ggplot(inbred_data_field, aes(x = Predicted_Moisture_Content, fill = Year))+
+  geom_density(alpha = 0.5)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  facet_wrap(Rep ~ Block)+
+  labs(title = 'Inbreds',
+       x = 'Nixtamalization Moisture Content')+
+  theme_classic()
+
+widiv_hybrid_data_field %>%
+  separate(Genotype, into = c('Egg_Parent', 'Pollen_Parent'), sep = ' X ') %>%
+  filter(Pollen_Parent %in% c('B73', 'MO17')) %>%
+  ggplot(aes(x = Pollen_Parent, y = Predicted_Moisture_Content, fill = Year))+
+  geom_boxplot(alpha = 0.5)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  facet_wrap(Rep ~ Block)+
+  labs(title = 'Hybrids',
+       x = 'Nixtamalization Moisture Content')+
+  theme_classic()
+```
+
+## Calculate BLUEs for Inbreds (Hybrids are done already)
+### Create the inbred mixed linear models
+```{r create the inbred mixed linear models, message = FALSE, warning = FALSE}
+mc_2022 = inbred_data_field %>%
+  filter(Year == 2022) %>%
+  select(Genotype, Predicted_Moisture_Content, Block, Rep) %>%
+  mutate(Rep = as.factor(Rep),
+         Block = as.factor(Block))
+
+inbred_blues_2022 = fixef(lmer(Predicted_Moisture_Content ~ Genotype + (1|Rep/Block), data = mc_2022)) %>%
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)')
+
+mc_2023 = inbred_data_field %>%
+  filter(Year == 2023) %>%
+  select(Genotype, Predicted_Moisture_Content, Block, Rep) %>%
+  mutate(Rep = as.factor(Rep),
+         Block = as.factor(Block))
+
+inbred_blues_2023 = fixef(lmer(Predicted_Moisture_Content ~ Genotype + (1|Rep/Block), data = mc_2023)) %>%
+  as_tibble(rownames = 'Genotype') %>%
+  rename(BLUE = 'value') %>%
+  mutate(BLUE = BLUE + BLUE[1],
+         Genotype = str_remove(Genotype, '^Genotype')) %>%
+  filter(Genotype != '(Intercept)')
+
+inbred_blues = inbred_blues_2022 %>%
+  mutate(Year = 2022) %>%
+  bind_rows(inbred_blues_2023 %>%
+              mutate(Year = 2023))
+
+plot(lmer(Predicted_Moisture_Content ~ Genotype + (1|Rep/Block), data = mc_2022))
+plot(lmer(Predicted_Moisture_Content ~ Genotype + (1|Rep/Block), data = mc_2023))
+```
+
+Again, residuals look good!
+
+Now that the BLUEs have been calculated, we can plot the various plots we will be making. One of the comparisons we want to make is by looking specifically at heterotic patterns to see if there is a difference between all hybrids vs those withing a NSSS/SSS cross. We will load a table that has the information necessary to complete this analysis, and then perform each analysis on all data followed by the analysis on a subset of data.
+
+## Load the Heterotic Group Data
+```{r load heterotic group data}
+heterotic_groups = read_csv('../Data/widiv_heterotic_groups.csv') %>%
+  mutate(Genotype = toupper(Genotype)) %>%
+  filter(Genotype %in% unique(inbred_data_field$Genotype))
+```
+
+## Hybrid Performance vs Midparent Value
+### All Samples
+```{r calculating midparent value}
+combined_blues = hybrid_blues %>%
+  left_join(inbred_blues,
+            by = c('egg_parent' = 'Genotype', 'Year')) %>%
+  rename(egg_parent_blue = 'BLUE.y',
+         hybrid_blue = 'BLUE.x') %>%
+  left_join(inbred_blues,
+            by = c('pollen_parent' = 'Genotype', 'Year')) %>%
+  rename(pollen_parent_blue = BLUE) %>%
+  mutate(mid_parent = (egg_parent_blue + pollen_parent_blue) / 2) %>%
+  filter(!is.na(egg_parent_blue),
+         !is.na(pollen_parent_blue),
+         !is.na(hybrid_blue)) %>%
+  rowwise() %>%
+  mutate(high_parent = max(egg_parent_blue, pollen_parent_blue)) %>%
+  left_join(heterotic_groups %>%
+              select(Genotype, Heterotic_Group),
+            by = c('egg_parent' = 'Genotype')) %>%
+  rename(egg_het_group = Heterotic_Group) %>%
+  left_join(heterotic_groups %>%
+              select(Genotype, Heterotic_Group),
+            by = c('pollen_parent' = 'Genotype')) %>%
+  rename(pollen_het_group = Heterotic_Group) %>%
+  mutate(heterotic_cross = case_when(egg_het_group == 'stiff_stalk' & pollen_het_group == 'non_stiff_stalk' ~ 'Yes',
+                                     egg_het_group == 'non_stiff_stalk' & pollen_het_group == 'stiff_stalk' ~ 'Yes',
+                                     TRUE ~ 'Unknown'))
+
+combined_blues %>%
+  ggplot(aes(x = mid_parent, y = hybrid_blue, color = factor(Year)))+
+  geom_abline(linetype = 'dashed', color = 'gray60')+
+  geom_point()+
+  labs(x = 'Midparent Nixtamalization Moisture Content',
+       y = 'Hybrid Nixtamalization Moisture Content',
+       color = 'Year')+
+  geom_smooth(method = 'lm', se = F, formula = 'y~x')+
+  theme_classic()
+
+combined_blues %>%
+  ggplot(aes(x = high_parent, y = hybrid_blue, color = factor(Year)))+
+  geom_abline(linetype = 'dashed', color = 'gray60')+
+  geom_point()+
+  labs(x = 'High Parent Nixtamalization Moisture Content',
+       y = 'Hybrid Nixtamalization Moisture Content',
+       color = 'Year')+
+  geom_smooth(method = 'lm', se = F, formula = 'y~x')+
+  theme_classic()
+```
+
+### Heterotic Pattern
+```{r calculating midparent value for heterotic patterns}
+combined_blues %>%
+  filter(heterotic_cross == 'Yes') %>%
+  ggplot(aes(x = mid_parent, y = hybrid_blue, color = factor(Year)))+
+  geom_abline(linetype = 'dashed', color = 'gray60')+
+  geom_point()+
+  labs(x = 'Midparent Nixtamalization Moisture Content',
+       y = 'Hybrid Nixtamalization Moisture Content',
+       color = 'Year')+
+  geom_smooth(method = 'lm', se = F, formula = 'y~x')+
+  theme_classic()
+
+combined_blues %>%
+  filter(heterotic_cross == 'Yes') %>%
+  ggplot(aes(x = high_parent, y = hybrid_blue, color = factor(Year)))+
+  geom_abline(linetype = 'dashed', color = 'gray60')+
+  geom_point()+
+  labs(x = 'High Parent Nixtamalization Moisture Content',
+       y = 'Hybrid Nixtamalization Moisture Content',
+       color = 'Year')+
+  geom_smooth(method = 'lm', se = F, formula = 'y~x')+
+  theme_classic()
+```
+
+## Midparent and High Parent Heterosis
+### All Samples
+```{r heterosis plots, message = FALSE, warning = FALSE}}
+mid_high_data = combined_blues %>%
+  ungroup() %>%
+  mutate(MPH = (hybrid_blue - mid_parent),
+         HPH = (hybrid_blue - high_parent)) %>%
+  pivot_longer(cols = c(MPH, HPH),
+               names_to = 'Heterosis_Type',
+               values_to = 'Deviation')
+
+for(Year in c(2022, 2023)){
+  for(Heterosis_Type in c('MPH', 'HPH')){
+    for(pollen_parent in c('B73', 'MO17', 'Overall')){
+      if(pollen_parent == 'Overall'){
+        results = t.test(mid_high_data$Deviation[mid_high_data$Year == Year &
+                                             mid_high_data$Heterosis_Type == Heterosis_Type],
+                       mu = 0)
+      print(paste('---', Year, Heterosis_Type, pollen_parent, '---'))
+      print(results$p.value)
+      print(results$estimate)
+      } else{
+        results = t.test(mid_high_data$Deviation[mid_high_data$Year == Year &
+                                               mid_high_data$Heterosis_Type == Heterosis_Type &
+                                               mid_high_data$pollen_parent == pollen_parent],
+                         mu = 0)
+        print(paste('---', Year, Heterosis_Type, pollen_parent, '---'))
+        print(results$p.value)
+        print(results$estimate)
+      }
+    }
+  }
+}
+
+heterosis_plot = mid_high_data %>%
+  mutate(Heterosis_Type = factor(Heterosis_Type, levels = c('MPH', 'HPH'))) %>%
+  ggplot(aes(x = Deviation, fill = pollen_parent))+
+  geom_density(alpha = 0.5, show.legend = F)+
+  geom_vline(xintercept = 0, linetype = 'dashed', color = 'gray60')+
+  scale_fill_manual(values = c('MO17' = 'darkviolet', 'B73' = 'darkgreen'))+
+  facet_grid(Year~Heterosis_Type, scales = 'free')+
+  scale_x_continuous(limits = c(-0.06, 0.06), breaks = seq(-0.05, 0.05, 0.05))+
+  labs(x = 'Deviation from Parent',
+       tag = 'A')+
+  theme_classic()+
+  theme(text = element_text(size = 12, color = 'black'),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+heterosis_plot
+
+ggsave('../Outputs/heterosis_plot.png',
+       heterosis_plot,
+       device = 'png',
+       width = 3.75,
+       height = 3.5,
+       units = 'in',
+       bg = 'transparent')
+```
+
+### Heterotic Pattern
+```{r heterosis plots, message = FALSE, warning = FALSE}}
+mid_high_data = combined_blues %>%
+  filter(heterotic_cross == 'Yes') %>%
+  ungroup() %>%
+  mutate(MPH = (hybrid_blue - mid_parent),
+         HPH = (hybrid_blue - high_parent)) %>%
+  pivot_longer(cols = c(MPH, HPH),
+               names_to = 'Heterosis_Type',
+               values_to = 'Deviation')
+
+for(Year in c(2022, 2023)){
+  for(Heterosis_Type in c('MPH', 'HPH')){
+    for(pollen_parent in c('B73', 'MO17')){
+      results = t.test(mid_high_data$Deviation[mid_high_data$Year == Year &
+                                             mid_high_data$Heterosis_Type == Heterosis_Type &
+                                             mid_high_data$pollen_parent == pollen_parent],
+                       mu = 0)
+      print(paste('---', Year, Heterosis_Type, pollen_parent, '---'))
+      print(results$p.value)
+      print(results$estimate)
+    }
+  }
+}
+
+heterosis_plot = mid_high_data %>%
+  ggplot(aes(x = Deviation, fill = pollen_parent))+
+  geom_density(alpha = 0.5, show.legend = F)+
+  geom_vline(xintercept = 0, linetype = 'dashed', color = 'gray60')+
+  scale_fill_manual(values = c('MO17' = 'darkviolet', 'B73' = 'darkgreen'))+
+  facet_grid(Year~Heterosis_Type, scales = 'free')+
+  labs(x = 'Deviation from Parent',
+       tag = 'A')+
+  theme_classic()
+
+heterosis_plot
+
+# ggsave('../Outputs/heterosis_plot_heterotic_pattern.png',
+#        heterosis_plot,
+#        device = 'png',
+#        width = 3.75,
+#        height = 3.5,
+#        units = 'in',
+#        bg = 'transparent')
+```
+
+There is a strong heterosis by year effect. It appears that hybrids tend to have higher NMC than midparent and high parent in 2022 and lower NMC than midparent and high parent in 2023. This pattern holds for both Mo17 and B73 crosses. I would have to look back and the growing seasons to see if there is a reason 2022 would be more favorable to high starch, low protein, low oil grain than 2023 for hybrids but not inbreds. 
+
+## Plot hybrids vs inbred parents
+### All Samples
+```{r hybrid vs inbred nmc, message = FALSE, warning = FALSE}
+hybrid_vs_inbred_parents = combined_blues %>%
+  pivot_longer(cols = c(egg_parent_blue, hybrid_blue, pollen_parent_blue),
+               names_to = 'Individual',
+               values_to = 'BLUE') %>%
+  mutate(Individual = case_when(Individual == 'egg_parent_blue' ~ 'Egg\nParent',
+                                Individual == 'hybrid_blue' ~ 'Hybrid',
+                                Individual == 'pollen_parent_blue' ~ 'Pollen\nParent')) %>%
+  filter(pollen_parent %in% c('B73', 'MO17')) %>%
+  ggplot(aes(x = Individual, y = BLUE, group = paste(egg_parent, pollen_parent), color = pollen_parent))+
+  geom_line(alpha = 0.3, show.legend = F)+
+  scale_color_manual(values = c('MO17' = 'darkviolet', 'B73' = 'darkgreen'))+
+  scale_x_discrete(expand = c(0.1,0.1))+
+  labs(x = NULL,
+       y = 'Nixtamalization Moisture Content BLUE',
+       color = 'Pollen Parent',
+       tag = 'C')+
+  facet_wrap(~Year, ncol = 1)+
+  #guides(color = guide_legend(override.aes = list(alpha = 1)))+
+  theme_classic()+
+  theme(text = element_text(size = 12, color = 'black'))
+
+hybrid_vs_inbred_parents
+
+ggsave('../Outputs/hybrid_vs_inbred_parents.png',
+       hybrid_vs_inbred_parents,
+       device = 'png',
+       width = 2.5,
+       height = 3.5,
+       units = 'in',
+       bg = 'transparent')
+
+# For Posters
+poster_figure = hybrid_vs_inbred_parents +
+  labs(tag = NULL)+
+  scale_color_manual(values = c('MO17' = 'gray30', 'B73' = 'black'))+
+  #annotate('text', x = 3.1, y = 0.4277, label = 'Mo17', color = 'gray30')+
+  theme(text = element_text(size = 20, color = 'black'),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        strip.background = element_rect(fill='transparent')) #transparent
+
+ggsave('~/Desktop/inbred_hybrid_relationship.png', poster_figure, device = 'png', width = 9.9, height = 8, units = 'in', bg = 'transparent')
+```
+
+### Heterotic Pattern
+```{r hybrid vs inbred nmc, message = FALSE, warning = FALSE}
+hybrid_vs_inbred_parents = combined_blues %>%
+  filter(heterotic_cross == 'Yes') %>%
+  pivot_longer(cols = c(egg_parent_blue, hybrid_blue, pollen_parent_blue),
+               names_to = 'Individual',
+               values_to = 'BLUE') %>%
+  mutate(Individual = case_when(Individual == 'egg_parent_blue' ~ 'Egg Parent',
+                                Individual == 'hybrid_blue' ~ 'Hybrid',
+                                Individual == 'pollen_parent_blue' ~ 'Pollen Parent')) %>%
+  ggplot(aes(x = Individual, y = BLUE, group = paste(egg_parent, pollen_parent), color = pollen_parent))+
+  geom_line(alpha = 0.3, show.legend = F)+
+  scale_color_manual(values = c('MO17' = 'darkviolet', 'B73' = 'darkgreen'))+
+  scale_x_discrete(expand = c(0.1,0.1))+
+  labs(x = NULL,
+       y = 'Nixtamalization Moisture Content BLUE',
+       color = 'Pollen Parent',
+       tag = 'B')+
+  facet_wrap(~Year, ncol = 1)+
+  #guides(color = guide_legend(override.aes = list(alpha = 1)))+
+  theme_classic()+
+  theme(text = element_text(size = 12, color = 'black'))
+
+hybrid_vs_inbred_parents
+
+# ggsave('../Outputs/hybrid_vs_inbred_parents_heterotic_pattern.png',
+#        hybrid_vs_inbred_parents,
+#        device = 'png',
+#        width = 3.75,
+#        height = 3.5,
+#        units = 'in',
+#        bg = 'transparent')
+```
+
+## Plot the NMC values of the inbred parents
+### All Samples
+```{r inbred parents, message = FALSE, warning = FALSE}
+inbred_nmc_plot = inbred_data_field %>%
+  ggplot(aes(x = Predicted_Moisture_Content, fill = Year))+
+  geom_density(alpha = 0.5)+
+  labs(x = 'Nixtamalization Moisture Content',
+       tag = 'B')+
+  scale_fill_manual(values = c('2022' = 'darkred', '2023' = 'darkblue'))+
+  theme_classic()+
+  theme(legend.position = 'bottom',
+        text = element_text(size = 12, color = 'black'))
+
+ggsave('../Outputs/inbred_nmc_plot.png',
+       inbred_nmc_plot,
+       device = 'png',
+       width = 3.75,
+       height = 3.5,
+       units = 'in',
+       bg = 'transparent')
+```
+
+## Predict hybrids from inbred parents
+### All Samples
+```{r predict hybrids from inbreds, message = FALSE, warning = FALSE}
+year = c()
+rep = c()
+r2 = c()
+b73_r2 = c()
+mo17_r2 = c()
+pollen_parent_sig = c()
+egg_parent_sig = c()
+interaction_sig = c()
+for(y in c(2022, 2023)){
+  for(i in c(1:100)){
+    set.seed(i)
+    
+    combined_blues_train = combined_blues %>%
+      filter(Year == y) %>%
+      select(Genotype, egg_parent_blue, pollen_parent_blue, hybrid_blue) %>%
+      ungroup() %>%
+      sample_frac(0.8)
+    
+    combined_blues_test = combined_blues %>%
+      filter(Year == y) %>%
+      anti_join(combined_blues_train)
+    
+    model = lm(hybrid_blue ~ egg_parent_blue + pollen_parent_blue + egg_parent_blue:pollen_parent_blue, 
+                    data = combined_blues_train)
+    
+    pollen_parent_sig = c(pollen_parent_sig, summary(model)$coefficients[3,4])
+    egg_parent_sig = c(egg_parent_sig, summary(model)$coefficients[2,4])
+    interaction_sig = c(interaction_sig, summary(model)$coefficients[4,4])
+    
+    year = c(year, y)
+    rep = c(rep, i)
+    r2 = c(r2, cor(predict(model, newdata = combined_blues_test), combined_blues_test$hybrid_blue)^2)
+    b73_r2 = c(b73_r2, cor(predict(model,
+                                   newdata = combined_blues_test %>% filter(pollen_parent == 'B73')),
+                           combined_blues_test %>%
+                             filter(pollen_parent == 'B73') %>%
+                             select(hybrid_blue) %>%
+                             pull())^2)
+    mo17_r2 = c(mo17_r2, cor(predict(model,
+                                     newdata = combined_blues_test %>% filter(pollen_parent == 'MO17')),
+                             combined_blues_test %>%
+                             filter(pollen_parent == 'MO17') %>%
+                             select(hybrid_blue) %>%
+                             pull())^2)
+  }
+}
+
+# Model Term Significances
+mean(pollen_parent_sig < 0.05)
+mean(egg_parent_sig < 0.05)
+mean(interaction_sig < 0.05)
+
+# Performance by group
+tibble(Year = year,
+       Rep = rep,
+       Overall = r2,
+       B73 = b73_r2,
+       Mo17 = mo17_r2) %>%
+  pivot_longer(cols = c(Overall, B73, Mo17),
+               names_to = 'Group',
+               values_to = 'R2') %>%
+  mutate(Group = factor(Group, levels = c('Overall', 'B73', 'Mo17'))) %>%
+  group_by(Group, Year) %>%
+  summarize(Mean_R2 = mean(R2),
+            min_R2 = min(R2),
+            max_R2 = max(R2))
+
+pred_hyb_from_inb_plot = tibble(Year = year,
+       Rep = rep,
+       Overall = r2,
+       B73 = b73_r2,
+       Mo17 = mo17_r2) %>%
+  pivot_longer(cols = c(Overall, B73, Mo17),
+               names_to = 'Group',
+               values_to = 'R2') %>%
+  mutate(Group = factor(Group, levels = c('Overall', 'B73', 'Mo17'))) %>%
+  ggplot(aes(x = R2, fill = Group))+
+  geom_density()+
+  facet_grid(Year~Group)+
+  scale_fill_manual(values = c('Overall' = 'darkorange', 'B73' = 'darkgreen', 'Mo17' = 'darkviolet'))+
+  xlim(0,1)+
+  theme_classic()+
+  labs(x = 'Coefficient of Determination',
+       fill = 'Pollen Parent',
+       tag = 'D')+
+  theme(legend.position = 'bottom',
+        legend.margin = margin(0,0,0,0),
+        text = element_text(size = 12, color = 'black'),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+pred_hyb_from_inb_plot
+
+ggsave('../Outputs/pred_hyb_from_inb_plot.png',
+       pred_hyb_from_inb_plot,
+       device = 'png',
+       width = 5,
+       height = 3.5,
+       units = 'in',
+       bg = 'transparent')
+```
+
+The hybrids seem to be more difficult to predict from the inbreds in 2023. This is likely a Simpson's paradox effect though as there is more separation in hybrid values in 2022 between Mo17 and B73 samples.
+
+### Hetertic Pattern
+```{r predict hybrids from inbreds, message = FALSE, warning = FALSE}
+year = c()
+rep = c()
+r2 = c()
+b73_r2 = c()
+mo17_r2 = c()
+for(y in c(2022, 2023)){
+  for(i in c(1:100)){
+    set.seed(i)
+    
+    combined_blues_train = combined_blues %>%
+      filter(heterotic_cross == 'Yes') %>%
+      filter(Year == y) %>%
+      select(Genotype, egg_parent_blue, pollen_parent_blue, hybrid_blue) %>%
+      ungroup() %>%
+      sample_frac(0.8)
+    
+    combined_blues_test = combined_blues %>%
+      filter(heterotic_cross == 'Yes') %>%
+      filter(Year == y) %>%
+      anti_join(combined_blues_train)
+    
+    model = lm(hybrid_blue ~ egg_parent_blue + pollen_parent_blue + egg_parent_blue:pollen_parent_blue, 
+                    data = combined_blues_train)
+    
+    
+    
+    year = c(year, y)
+    rep = c(rep, i)
+    r2 = c(r2, cor(predict(model, newdata = combined_blues_test), combined_blues_test$hybrid_blue)^2)
+    b73_r2 = c(b73_r2, cor(predict(model,
+                                   newdata = combined_blues_test %>% filter(pollen_parent == 'B73')),
+                           combined_blues_test %>%
+                             filter(pollen_parent == 'B73') %>%
+                             select(hybrid_blue) %>%
+                             pull())^2)
+    mo17_r2 = c(mo17_r2, cor(predict(model,
+                                     newdata = combined_blues_test %>% filter(pollen_parent == 'MO17')),
+                             combined_blues_test %>%
+                             filter(pollen_parent == 'MO17') %>%
+                             select(hybrid_blue) %>%
+                             pull())^2)
+  }
+}
+
+pred_hyb_from_inb_plot = tibble(Year = year,
+       Rep = rep,
+       Overall = r2,
+       B73 = b73_r2,
+       Mo17 = mo17_r2) %>%
+  pivot_longer(cols = c(Overall, B73, Mo17),
+               names_to = 'Group',
+               values_to = 'R2') %>%
+  mutate(Group = factor(Group, levels = c('Overall', 'B73', 'Mo17'))) %>%
+  ggplot(aes(x = R2, fill = Group))+
+  geom_density()+
+  facet_grid(Year~Group)+
+  scale_fill_manual(values = c('Overall' = 'darkorange', 'B73' = 'darkgreen', 'Mo17' = 'darkviolet'))+
+  xlim(0,1)+
+  theme_classic()+
+  labs(x = 'Coefficient of Determination',
+       fill = 'Pollen Parent',
+       tag = 'C')+
+  theme(legend.position = 'bottom',
+        legend.margin = margin(0,0,0,0),
+        text = element_text(size = 12, color = 'black'))
+
+pred_hyb_from_inb_plot
+
+# ggsave('../Outputs/pred_hyb_from_inb_plot_heterotic_pattern.png',
+#        pred_hyb_from_inb_plot,
+#        device = 'png',
+#        width = 7.5,
+#        height = 2.5,
+#        units = 'in',
+#        bg = 'transparent')
+```
+
+# GWAS on Hybrid Samples
+
+A lot of the computation for this will be done with various scripts on the MSI supercomputers. I will need to create a new hapmap of hybrid genotypes though. I first need to make a list of all WiDiv genotypes used in this study so I can reduce the number of columns in the hapmap to match. 
+
+
+After reducing the number of columns I need to change heterozygous sites to missing (NN) because it is not going to be informative when I computationally derive the hybrid genotypes. Then I can filter out sites with greater than 15% missing data. I can then compute the hybrid genotypes and filter sites with less than 5% MAF.
+
+## Create a list of all WiDiv genotypes used to make hybrids
+```{r create list of genotypes}
+widiv_plot_xref %>%
+  filter(str_detect(Plot, "^YCH")) %>% # Filter for widiv hybrids
+  select(Genotype) %>% # Select the genotype column
+  filter(str_detect(Genotype, 'X B73$') | str_detect(Genotype, 'X MO17$')) %>% # Filter for B73 and Mo17 crosses
+  mutate(Genotype = str_remove(Genotype, ' X B73$'), # remove the b73 and mo17 tags
+         Genotype = str_remove(Genotype, ' X MO17$'),
+         Genotype = str_remove(Genotype, ' \\(.*\\)'), # remove anything within parentheses in the name
+         Genotype = str_remove(Genotype, '/.*'), # remove anything after a slash in the name
+         Genotype = str_replace_all(Genotype, ' ', '.'), # replace spaces with periods
+         Genotype = str_replace_all(Genotype, '-', '.')) %>% # replace dashes with periods
+  unique() %>% # remove duplicates
+  bind_rows(tibble(Genotype = 'B73')) %>% # add B73 (mo17 is already used as an egg parent)
+  arrange(Genotype) %>% # sort the genotypes alphabetically
+  mutate(Genotype = case_when(str_detect(Genotype, '^[0-9]') ~ paste0('X', Genotype), # add an X to the beginning of the name if it starts with a number
+                              TRUE ~ Genotype)) %>%
+  write_csv('~/Desktop/Grad_School/Research/HNMC_Breeding/Data/inbreds_used_to_generate_hybrids.csv') # write the list to a csv
+```
+
+## Create a list of the hybrids used in this study
+```{r create list of hybrids}
+widiv_plot_xref %>%
+  filter(str_detect(Plot, "^YCH")) %>% # Filter for widiv hybrids
+  select(Genotype) %>% # Select the genotype column
+  filter(str_detect(Genotype, 'X B73$') | str_detect(Genotype, 'X MO17$')) %>% # Filter for B73 and Mo17 crosses
+  mutate(Tester = case_when(str_detect(Genotype, ' X B73$') ~ 'B73', # Determine the tester
+                            str_detect(Genotype, ' X MO17$') ~ 'MO17'),
+         Genotype = str_remove(Genotype, ' X B73$'), # remove the b73 and mo17 tags
+         Genotype = str_remove(Genotype, ' X MO17$'),
+         Genotype = str_remove(Genotype, ' \\(.*\\)'), # remove anything within parentheses in the name
+         Genotype = str_remove(Genotype, '/.*'), # remove anything after a slash in the name
+         Genotype = str_replace_all(Genotype, ' ', '.'), # replace spaces with periods
+         Genotype = str_replace_all(Genotype, '-', '.')) %>% # replace dashes with periods
+  unique() %>% # remove duplicates
+  mutate(Genotype = paste0(Genotype, ' X ', Tester)) %>% # add the tester to the genotype name
+  select(-Tester) %>%
+  arrange(Genotype) %>% # sort the genotypes alphabetically
+  mutate(Genotype = case_when(str_detect(Genotype, '^[0-9]') ~ paste0('X', Genotype), # add an X to the beginning of the name if it starts with a number
+                              TRUE ~ Genotype)) %>%
+  write_csv('~/Desktop/Grad_School/Research/HNMC_Breeding/Data/widiv_b_m_hybrids.csv') # write the list to a csv
+```
+
+## Create a phenotype files
+These will be uploaded to the super computer to run gwas analysis with
+```{r create phenotype files, message = FALSE, warning = FALSE}
+combined_blues %>% # Filter for widiv hybrids
+  select(Genotype, hybrid_blue, Year) %>% # Select the necessary columns
+  rename(BLUE = hybrid_blue) %>% # Rename the hybrid_blue column to BLUE
+  filter(str_detect(Genotype, 'X B73$') | str_detect(Genotype, 'X MO17$')) %>% # Filter for B73 and Mo17 crosses
+  mutate(Tester = case_when(str_detect(Genotype, ' X B73$') ~ 'B73', # Determine the tester
+                            str_detect(Genotype, ' X MO17$') ~ 'MO17'),
+         Genotype = str_remove(Genotype, ' X B73$'), # remove the b73 and mo17 tags
+         Genotype = str_remove(Genotype, ' X MO17$'),
+         Genotype = str_remove(Genotype, ' \\(.*\\)'), # remove anything within parentheses in the name
+         Genotype = str_remove(Genotype, '/.*'), # remove anything after a slash in the name
+         Genotype = str_replace_all(Genotype, ' ', '.'), # replace spaces with periods
+         Genotype = str_replace_all(Genotype, '-', '.')) %>% # replace dashes with periods
+  unique() %>% # remove duplicates
+  mutate(Genotype = paste0(Genotype, ' X ', Tester)) %>% # add the tester to the genotype name
+  select(-Tester) %>%
+  arrange(Genotype) %>% # sort the genotypes alphabetically
+  mutate(Genotype = case_when(str_detect(Genotype, '^[0-9]') ~ paste0('X', Genotype), # add an X to the beginning of the name if it starts with a number
+                              TRUE ~ Genotype)) %>%
+  write_csv('../Data/widiv_hybrid_phenotype.csv') # write the list to a csv
+```
+
+
+# Genomic Selection for Nixtamalization Moisture Content
+## Heritability
+```{r nmc heritability}
+widiv_model = lmer(Predicted_Moisture_Content ~ (1|Genotype) + (1|Genotype:Year) + (1|Year/Rep/Block),
+     data = widiv_hybrid_data_field %>%
+       select(Genotype, Predicted_Moisture_Content, Year, Block, Rep) %>%
+       mutate(Rep = as.factor(Rep),
+              Block = as.factor(Block)))
+
+var_source <- broom::tidy(lmerTest::ranova(widiv_model)) %>%
+    select(term, p.value) %>%
+    filter(term != "<none>") %>%
+    mutate(term = str_remove_all(string = term, pattern = "[(,1, ,|,)]")) %>%
+    rename(Parameter = term)
+  
+var_exp <- summary(widiv_model)[[13]] %>%
+  as_tibble() %>%
+  select(grp, vcov) %>%
+  rename(Parameter = grp, 
+        var = vcov) %>%
+  mutate(total_var = sum(var),
+         Percent_Var = (var/total_var) * 100) %>%
+  select(Parameter, var, Percent_Var) %>%
+  full_join(var_source)
+
+var_exp %>%
+  mutate(n_env = 2,
+         n_reps = 2) %>%
+  select(Parameter, var, n_env, n_reps) %>%
+  filter(Parameter == "Genotype" |
+         Parameter == "Genotype:Year" |
+         Parameter == "Residual") %>%
+  pivot_wider(id_cols = c(n_env, n_reps), names_from = Parameter, values_from = var) %>%
+  mutate(Heritability = Genotype / (Genotype + (`Genotype:Year` / n_env) + (Residual / (n_env * n_reps)))) %>% select(Heritability)
+
+era_model = lmer(Predicted_Moisture_Content ~ (1|Genotype) + (1|Genotype:Year) + (1|Year/Rep/Block),
+     data = era_field_data %>%
+       left_join(hybrid_nmc, by = c('Sample_ID' = 'Sample_ID')) %>%
+       filter(!is.na(Predicted_Moisture_Content)) %>%
+       select(Genotype, Predicted_Moisture_Content, Year, Location, Block, Rep) %>%
+       mutate(Rep = as.factor(Rep),
+              Block = as.factor(Block),
+              Year = paste0(Year, Location)))
+
+var_source <- broom::tidy(lmerTest::ranova(era_model)) %>%
+    select(term, p.value) %>%
+    filter(term != "<none>") %>%
+    mutate(term = str_remove_all(string = term, pattern = "[(,1, ,|,)]")) %>%
+    rename(Parameter = term)
+  
+var_exp <- summary(era_model)[[13]] %>%
+  as_tibble() %>%
+  select(grp, vcov) %>%
+  rename(Parameter = grp, 
+        var = vcov) %>%
+  mutate(total_var = sum(var),
+         Percent_Var = (var/total_var) * 100) %>%
+  select(Parameter, var, Percent_Var) %>%
+  full_join(var_source)
+
+var_exp %>%
+  mutate(n_env = 2,
+         n_reps = 2) %>%
+  select(Parameter, var, n_env, n_reps) %>%
+  filter(Parameter == "Genotype" |
+         Parameter == "Genotype:Year" |
+         Parameter == "Residual") %>%
+  pivot_wider(id_cols = c(n_env, n_reps), names_from = Parameter, values_from = var) %>%
+  mutate(Heritability = Genotype / (Genotype + (`Genotype:Year` / n_env) + (Residual / (n_env * n_reps)))) %>% select(Heritability)
+
+ch_model = lmer(Predicted_Moisture_Content ~ (1|Genotype) + (1|Genotype:Year) + (1|Year/Rep),
+     data = ch_field_data %>%
+       left_join(hybrid_nmc, by = c('Sample_ID' = 'Sample_ID')) %>%
+       filter(!is.na(Predicted_Moisture_Content)) %>%
+       select(Genotype, Predicted_Moisture_Content, Year, Location, Rep) %>%
+       mutate(Rep = as.factor(Rep),
+              Year = paste0(Year, Location)))
+
+var_source <- broom::tidy(lmerTest::ranova(ch_model)) %>%
+    select(term, p.value) %>%
+    filter(term != "<none>") %>%
+    mutate(term = str_remove_all(string = term, pattern = "[(,1, ,|,)]")) %>%
+    rename(Parameter = term)
+  
+var_exp <- summary(ch_model)[[13]] %>%
+  as_tibble() %>%
+  select(grp, vcov) %>%
+  rename(Parameter = grp, 
+        var = vcov) %>%
+  mutate(total_var = sum(var),
+         Percent_Var = (var/total_var) * 100) %>%
+  select(Parameter, var, Percent_Var) %>%
+  full_join(var_source)
+
+var_exp %>%
+  mutate(n_env = 2,
+         n_reps = 2) %>%
+  select(Parameter, var, n_env, n_reps) %>%
+  filter(Parameter == "Genotype" |
+         Parameter == "Genotype:Year" |
+         Parameter == "Residual") %>%
+  pivot_wider(id_cols = c(n_env, n_reps), names_from = Parameter, values_from = var) %>%
+  mutate(Heritability = Genotype / (Genotype + (`Genotype:Year` / n_env) + (Residual / (n_env * n_reps)))) %>% select(Heritability)
+```
+
+## Phenotype File Creation
+```{r pheno-geno file matching}
+genos_with_phenos_separated = hybrid_blues_2022 %>%
+  bind_rows(hybrid_blues_2023) %>%
+  select(Genotype) %>%
+  unique() %>%
+  separate(Genotype, into = c('egg_parent', 'pollen_parent'), sep = ' X ') %>%
+  filter(!is.na(egg_parent),
+         !is.na(pollen_parent))
+
+genos_with_phenos = unique(c(unique(genos_with_phenos_separated$egg_parent),
+                             unique(genos_with_phenos_separated$pollen_parent)))
+
+genos_with_phenos[str_detect(genos_with_phenos, '^[0-9]')] = paste0('X',
+genos_with_phenos[str_detect(genos_with_phenos, '^[0-9]')])
+```
+
+## Loading and Cleaning SNP Data
+The data is loaded later to from a saved file to save time.
+```{r loading SNP data}
+geno_data = read_delim('../Data/Hapmap_for_GP.txt', delim = '\t') %>%
+  # rename(rs = `rs#`,
+  #        assembly = `assembly#`) %>%
+  unique() %>%
+  arrange(chrom, pos)
+```
+
+```{r assessing missing and het data}
+geno_data %>%
+  filter(nchar(alleles) == 3) %>%
+  pivot_longer(cols = -c(1:11),
+               names_to = 'Genotype',
+               values_to = 'Markers') %>%
+  summarise(missing_data = sum(Markers == 'NN', na.rm = T),
+            heterozygous_reads = sum(!Markers %in% c('AA','TT','CC','GG')) / n())
+```
+
+
+List heterozygous data as missing data since we aren't sure which SNP to use with complete confidence.
+```{r na to nn}
+geno_data_clean_long = geno_data %>%
+#   filter(nchar(alleles) == 3) %>%
+   pivot_longer(cols = -c(1:11),
+                names_to = 'Genotype',
+                values_to = 'Markers') %>%
+   mutate(Markers = case_when(is.na(Markers) ~ 'NN',
+                              !Markers %in% c('AA','TT','CC','GG') ~ 'NN',
+                              T ~ Markers),
+          Genotype = toupper(Genotype)) %>%
+  group_by(chrom,pos) %>%
+  filter(sum(Markers == 'NN') / n() < 0.05) %>%
+  ungroup() %>%
+  group_by(Genotype) %>%
+  filter(sum(Markers == 'NN') / n() < 0.05) %>%
+  filter(Genotype %in% genos_with_phenos)
+
+hapmap_col_names = colnames(geno_data_clean_long)[1:11]
+```
+
+### Checking the Missing Data Content
+```{r counting missing data by SNP and by Genotype}
+geno_data_clean_long %>%
+  group_by(chrom, pos) %>%
+  summarise(missing_data = sum(Markers == 'NN') / n(),
+            heterozygous_reads = sum(!Markers %in% c('AA','TT','CC','GG')) / n()) %>%
+  arrange(desc(heterozygous_reads)) %>% # This is just for running the code up to the plot to create a table
+  ggplot(aes(x = missing_data))+
+  geom_histogram()+
+  labs(title = 'Missing/Heterozygous Rates by Site')+
+  theme_classic()
+
+geno_data_clean_long %>%
+  group_by(Genotype) %>%
+  summarise(missing_data = sum(Markers == 'NN') / n(),
+            heterozygous_reads = sum(!Markers %in% c('AA','TT','CC','GG')) / n()) %>%
+  arrange(desc(heterozygous_reads)) %>% # This is just for running the code up to the plot to create a table
+  ggplot(aes(x = missing_data))+
+  geom_histogram()+
+  labs(title = 'Missing/Heterozygous Rates by Genotype')+
+  theme_classic()
+```
+
+Check to make sure this filtering didn't create any NA's
+```{r qc of missing snp filtering}
+geno_data_clean_long %>%
+  group_by(Genotype) %>%
+  summarise(missing_data = sum(Markers == 'NN')) %>%
+  mutate(relevant = case_when(Genotype %in% genos_with_phenos ~ 'Relevant',
+                              !Genotype %in% genos_with_phenos ~ 'Not Relevant')) %>%
+  group_by(relevant) %>%
+  summarise(missing_data = sum(missing_data),
+            count = n())
+```
+
+Looks good!  The widening the data did not create any NA gaps indicating that the data should have been filtered by entire sites or entire genotypes, not individual cells.
+
+```{r}
+snp_data_clean = geno_data_clean_long %>%
+  pivot_wider(id_cols = c(1:11),
+               names_from = Genotype,
+               values_from = Markers) %>%
+  select(-c(1:11))
+```
+
+
+## Imputing Missing Data
+There is a relatively small proportion of sites that have missing of heterozygous data, now should be a good time to impute any remaining missing data in the inbred lines before deriving the hybrids.
+```{r impute missing data}
+# Extract SNP data
+snp_data = geno_data_clean_long %>%
+  pivot_wider(id_cols = c(1:11),
+               names_from = Genotype,
+               values_from = Markers)
+
+# Check minor allele frequencies (not including NNs)
+count = 0
+missing_snps = 0
+for(allele in 1:nrow(snp_data)){
+  allele_count = table(snp_data %>%
+    select(12:ncol(snp_data)) %>%
+    slice(allele) %>%
+    unlist())
+
+  if('NN' %in% names(allele_count)){
+    missing_snps = missing_snps + allele_count[names(allele_count) == 'NN']
+  }
+
+  allele_count = allele_count[names(allele_count) != 'NN']
+
+  maf = allele_count[allele_count == min(allele_count)] / sum(allele_count)
+  if(maf < 0.05){
+    print(paste0('Minor Allele Frequency of ', maf, ' at SNP ', snp_data[allele,1]))
+    count = count + 1
+  }
+}
+count
+missing_snps
+
+
+cv_acc = c()
+maj_acc = c()
+pred_acc = c()
+time = c()
+count = 0
+imputed_snp_count = 0
+snp_data_t = snp_data %>%
+  pivot_longer(cols = -c(1:11),
+               names_to = 'Genotype',
+               values_to = 'Allele') %>%
+  ungroup() %>%
+  pivot_wider(id_cols = c(Genotype),
+               names_from = rs,
+               values_from = Allele)
+# Lets see how many genotypes don't have missing data
+miss_data = c()
+for(geno in colnames(snp_data_t)[2:ncol(snp_data_t)]){
+  miss_data = c(miss_data, sum(snp_data_t[geno] == 'NN'))
+}
+
+for(geno in colnames(snp_data_t)[2:ncol(snp_data_t)]){
+  # Print and track the iteration progress
+  if(count %% 10 == 0){
+    print(paste0('Processing Samples ', count, '-', count+9, ' | Average time per iteration: ', mean(time, na.rm = T)))
+  }
+  count = count + 1
+
+  # Determine if genotype has missing data, if not, skip it
+  if(sum(snp_data_t[geno] == 'NN', na.rm = T) == 0){
+    next
+  }
+  start = Sys.time()
+
+  # Determine where missing data is
+  rows_to_impute = which(snp_data_t[geno] == 'NN')
+
+  imputed_snp_count = imputed_snp_count + length(rows_to_impute)
+  # Create the dataset for training
+  train_data = snp_data_t %>%
+    select(-1) %>%
+    rename(GOI = geno) %>%
+    filter(GOI != 'NN') %>%
+    select(GOI, which(miss_data == 0))
+
+  print(nrow(train_data))
+
+  # Train the model (basic decision tree)
+  set.seed(1234)
+  tree_model = train(GOI ~ .,
+                     data = train_data,
+                     method = 'rpart',
+                     metric = 'Accuracy',
+                     tuneGrid = expand.grid(cp = 0.1), # This seems to be a decent value
+                     trControl = trainControl(method = "cv",
+                                              number = 5)
+                     )
+
+  # Make predictions and save
+  snp_data_t[rows_to_impute, geno] = predict(tree_model, snp_data_t[rows_to_impute,])
+
+  # Save metrics
+  cv_acc = c(cv_acc,
+             tree_model$results$Accuracy)
+  pred_acc = c(pred_acc,
+               mean(predict(tree_model, snp_data_t[-rows_to_impute,]) == snp_data_t[-rows_to_impute, geno][[1]]))
+  maj_acc = c(maj_acc,
+              mean(predict(tree_model, snp_data_t[-rows_to_impute,]) == rep(names(which.max(table(snp_data_t[-rows_to_impute, geno][[1]]))),
+                   length(predict(tree_model, snp_data_t[-rows_to_impute,])))))
+  time = c(time, Sys.time() - start)
+}
+
+paste('Imputed', imputed_snp_count, 'SNPs')
+
+imputation_plot = tibble(CV_Accuracy = cv_acc,
+       Prediction_Accuracy = pred_acc,
+       Major_Allele_Accuracy = maj_acc) %>%
+  pivot_longer(everything()) %>%
+  mutate(name = case_when(name == 'CV_Accuracy' ~ 'Cross Validation',
+                          name == 'Prediction_Accuracy' ~ 'Prediction',
+                          name == 'Major_Allele_Accuracy' ~ 'Major Allele')) %>%
+  ggplot(aes(x = value))+
+  geom_density(fill = 'gray40')+
+  labs(x = 'Imputation Accuracy')+
+  facet_wrap(~name, ncol = 1, scales = 'free_y')+
+  theme_classic()+
+  theme(legend.position = 'top',
+        text = element_text(size = 12, color = 'black'))
+
+ggsave('/Users/michael/Desktop/Grad_School/Research/HNMC_Breeding/Outputs/imputation_plot.png',imputation_plot, device = 'png', width = 3.75, height = 3.5, units = 'in', bg = 'transparent')
+
+# Check minor allele frequencies
+
+for(allele in 2:ncol(snp_data_t)){
+  allele_count = table(snp_data_t[,allele])
+
+  maf = allele_count[allele_count == min(allele_count)] / sum(allele_count)
+  if(maf < 0.05){
+    print(paste0('Minor Allele Frequency of ', maf, ' at SNP ', colnames(snp_data_t[,allele])))
+   print(allele_count)
+ }
+}
+
+geno_data_clean_long
+
+#beepr::beep(8)
+```
+
+### Convert back to a hapmap format
+```{r}
+snp_data_imputed = snp_data %>%
+  select(1:11) %>%
+  left_join(snp_data_t %>%
+              pivot_longer(cols = -1,
+                           names_to = 'Marker',
+                           values_to = 'Allele') %>%
+              pivot_wider(id_cols = Marker,
+                          names_from = Genotype,
+                          values_from = Allele) %>%
+              rename(rs = Marker))
+```
+
+### Check for Missing Data Again
+It looks like things have imputed well and the accuracy far outperforms that of selected the major allele. Lets look at the missing rates once more too make sure it is filled in.
+```{r counting missing data by SNP and by Genotype}
+snp_data_imputed %>%
+  pivot_longer(cols = -c(1:11),
+               names_to = 'Genotype',
+               values_to = 'Markers') %>%
+  group_by(chrom, pos) %>%
+  summarise(missing_data = sum(Markers == 'NN') / n(),
+            heterozygous_reads = sum(!Markers %in% c('AA','TT','CC','GG')) / n()) %>%
+  arrange(desc(heterozygous_reads)) %>% # This is just for running the code up to the plot to create a table
+  ggplot(aes(x = missing_data))+
+  geom_histogram()+
+  labs(title = 'Missing/Heterozygous Rates by Site')+
+  theme_classic()
+
+snp_data_imputed %>%
+  pivot_longer(cols = -c(1:11),
+               names_to = 'Genotype',
+               values_to = 'Markers') %>%
+  group_by(Genotype) %>%
+  summarise(missing_data = sum(Markers == 'NN') / n(),
+            heterozygous_reads = sum(!Markers %in% c('AA','TT','CC','GG')) / n()) %>%
+  arrange(desc(heterozygous_reads)) %>% # This is just for running the code up to the plot to create a table
+  ggplot(aes(x = missing_data))+
+  geom_histogram()+
+  labs(title = 'Missing/Heterozygous Rates by Genotype')+
+  theme_classic()
+```
+
+## Write/Read the Imputed Data File
+```{r save imputed snp file}
+ #write_delim(snp_data_imputed, '~/Desktop/Grad_School/Research/HNMC_Breeding/Data/GWAS_Based_Markers.imputed.hmp.txt', delim = '\t')
+
+# Read in imputed snp data
+snp_data_imputed = read_delim('../Data/GWAS_Based_Markers.imputed.hmp.txt', delim = '\t')
+```
+
+## Derive Hybid Genotypes from Inbred Parents
+No more missing data, lets make the new dataset long format and continue.
+```{r elongate the imputed snp data}
+snp_data_long = snp_data_imputed %>%
+  pivot_longer(cols = -c(1:11),
+               names_to = 'Genotype',
+               values_to = 'Markers')
+```
+
+Lets create a list of hybrids from our experiment
+```{r list of hybrids and their parents}
+hybrids_list = hybrid_blues %>%
+  select(egg_parent, pollen_parent) %>%
+  unique() %>%
+  mutate(hybrid = paste0(egg_parent, ' X ', pollen_parent), .before = egg_parent)
+```
+
+Now derive the hybrid genotypes from the inbred genotypes
+```{r}
+possible_combos = expand.grid(c('A', 'C', 'T', 'G', 'N'), c('A', 'C', 'T', 'G', 'N')) %>%
+  as_tibble() %>%
+  mutate(combos = paste0(Var1, Var2))
+
+hapmap_col_names = colnames(snp_data_long)[1:11]
+
+hybrid_hapmap = hybrids_list %>%
+  left_join(snp_data_long,
+            by = c('egg_parent' = 'Genotype')) %>%
+  rename(egg_marker = Markers) %>%
+  left_join(snp_data_long,
+            by = c('pollen_parent' = 'Genotype', hapmap_col_names)) %>%
+  rename(pollen_marker = Markers) %>%
+  mutate(egg_marker = str_remove(egg_marker, '[A,T,C,G,N]'),
+         pollen_marker = str_remove(pollen_marker, '[A,T,C,G,N]'),
+         hybrid_markers = paste0(egg_marker, pollen_marker)) %>%
+  select(hybrid, hapmap_col_names, hybrid_markers) %>%
+  filter(!is.na(rs)) %>%
+  #filter(is.na(hybrid_markers)) # debugging
+  pivot_wider(id_cols = hapmap_col_names,
+              values_from = hybrid_markers,
+              names_from = hybrid) %>%
+  unnest(everything()) %>%
+  unique() %>%
+  arrange(chrom,pos)
+
+write_delim(hybrid_hapmap, '~/Desktop/Grad_School/Research/HNMC_Breeding/Data/GWAS_Based_Hybrid_Hapmap.hmp.txt', delim = '\t')
+```
+
+## Convert Hapmap to Numerical Data
+Now that we have the hybrid data, lets convert it to a numerical dataset
+```{r hapmap numericalization}
+hybrid_num = hybrid_hapmap %>%
+  mutate(allele_0 = paste0(str_sub(alleles, 1, 1), str_sub(alleles, 1, 1)),
+         allele_2 = paste0(str_sub(alleles, 3, 3), str_sub(alleles, 3, 3)), .before = 3) %>%
+  pivot_longer(cols = -c(1:13),
+               names_to = 'Genotype',
+               values_to = 'Allele') %>%
+  mutate(allele_num = case_when(Allele == allele_0 ~ 0,
+                                Allele == allele_2 ~ 2,
+                                Allele != allele_0 & Allele != allele_2 ~ 1)) %>%
+  pivot_wider(id_cols = Genotype,
+              names_from = rs,
+              values_from = allele_num) %>%
+  rename(taxa = Genotype)
+```
+
+### Preparing Phenotypic File
+Lets make sure the phenotype file is ready (same order and contents as the numerical hapmap file).
+```{r preparing phenotype file}
+hybrid_phenotype_data_2022 = hybrid_blues_2022 %>% 
+  select(egg_parent, pollen_parent, Genotype, BLUE) %>%
+  filter(!is.na(BLUE)) %>%
+  filter(Genotype %in% hybrid_num$taxa,
+         Genotype %in% hybrid_blues_2022$Genotype) %>%
+  arrange(Genotype) %>%
+  filter(pollen_parent %in% c('B73', 'MO17'))
+
+hybrid_phenotype_data_2023 = hybrid_blues_2023 %>% 
+  select(egg_parent, pollen_parent, Genotype, BLUE) %>%
+  filter(!is.na(BLUE)) %>%
+  filter(Genotype %in% hybrid_num$taxa,
+         Genotype %in% hybrid_blues_2022$Genotype) %>%
+  arrange(Genotype) %>%
+  filter(pollen_parent %in% c('B73', 'MO17'))
+
+# Are the genotypes all the same?
+sum(hybrid_phenotype_data_2022$Genotype == hybrid_phenotype_data_2023$Genotype) == nrow(hybrid_phenotype_data_2022)
+```
+
+Filter the genetic dataset for those with a phenotype
+```{r filtering genetic data for phenotypes}
+hybrid_num_sub = hybrid_num %>%
+  filter(taxa %in% hybrid_phenotype_data_2022$Genotype) %>%
+  arrange(taxa)
+
+sum(hybrid_num_sub$taxa == hybrid_phenotype_data_2022$Genotype) == nrow(hybrid_num_sub)
+sum(hybrid_num_sub$taxa == hybrid_phenotype_data_2023$Genotype) == nrow(hybrid_num_sub)
+
+# Save the numericalized dataset
+hybrid_num %>%
+  filter(!str_detect(taxa, 'X LH244$'),
+         !str_detect(taxa, 'X LH295$')) %>%
+  mutate(.before = 2,
+         Pheno_Present = case_when(taxa %in% hybrid_num_sub$taxa ~ 'Yes',
+                                   !taxa %in% hybrid_num_sub$taxa ~ 'No')) %>%
+  write_delim('../Outputs/widiv_hybrids_gs_num.hmp.txt', delim = '\t')
+```
+
+### CV1 - Unknown Genetics in Known Environments
+```{r rrblup cv1}
+gp_outcomes_cv1 = tibble()
+phenotype_data_by_year = list(x2022 = hybrid_phenotype_data_2022,
+                              x2023 = hybrid_phenotype_data_2023)
+
+prediction_storage = tibble()
+
+for(rep in 1:10){
+  print(paste('---', rep, '---'))
+  set.seed(rep)
+  egg_parent_for_taxa = hybrid_num_sub %>%
+    mutate(egg_parent = str_extract(taxa, '.* X '), .before = 2) %>%
+    select(taxa, egg_parent)
+  
+  fold_index = groupKFold(egg_parent_for_taxa$egg_parent, k = 10)
+  
+  # Determine tester as a fixed effect
+  X <- as.matrix(data.frame(B73 = as.numeric(grepl(" X B73",
+                                                    hybrid_num_sub$taxa)),
+                             MO17 = as.numeric(grepl(" X MO17", 
+                                                    hybrid_num_sub$taxa))))
+  #test_index = sample(1:nrow(hybrid_num_sub), 100) # For random sampling
+  
+  for(year in c('x2022', 'x2023')){
+    print(year)
+
+    for(fold in names(fold_index)){
+      train_geno = hybrid_num_sub[fold_index[[fold]],]
+      train_pheno = phenotype_data_by_year[[year]][fold_index[[fold]],]
+      test_geno = hybrid_num_sub[-fold_index[[fold]],]
+      test_pheno = phenotype_data_by_year[[year]][-fold_index[[fold]],]
+    
+      if(sum(train_pheno$egg_parent %in% test_pheno$egg_parent) > 0){
+        stop('Egg parents are not fold-specific')
+      }
+      
+      X_train = X[fold_index[[fold]],]
+      
+      rrblup_model = rrBLUP::mixed.solve(as.matrix(train_pheno[,'BLUE']),
+                                         X = X_train,
+                          as.matrix(train_geno[2:ncol(train_geno)]))
+    
+      #dim(as.matrix(test_geno[2:ncol(test_geno)]))
+      #dim(rrblup_model$u)
+      
+      X_test = X[-fold_index[[fold]],]
+      
+      marker_effects_sum = as.matrix(test_geno[2:ncol(test_geno)]) %*% rrblup_model$u
+      phenotype_pred = marker_effects_sum[,1] + X_test%*%c(rrblup_model$beta)
+
+      prediction_storage = prediction_storage %>%
+        bind_rows(tibble(Year = year,
+                         Rep = rep,
+                         Fold = fold,
+                         Genotype = test_geno$taxa,
+                         Prediction = phenotype_pred))
+      
+      # print(test_pheno %>%
+      #         mutate(predictions = phenotype_pred) %>%
+      #         ggplot(aes(x = predictions,
+      #                    y = BLUE,
+      #                    color = pollen_parent))+
+      #         geom_point()+
+      #         theme_classic()) # Debugging
+      
+      gp_outcomes_cv1 = gp_outcomes_cv1 %>%
+        bind_rows(tibble(Fold = fold,
+                         Year = str_remove(year, 'x'),
+                         Rep = rep,
+                         RMSE = RMSE(phenotype_pred,
+                                   test_pheno[,'BLUE'][[1]]),
+                         Rs = cor(phenotype_pred,
+                                  test_pheno[,'BLUE'],
+                                  method = 'spearman'),
+                         RMSE_M = RMSE(phenotype_pred[test_pheno$pollen_parent == 'MO17'],
+                                     test_pheno[test_pheno$pollen_parent == 'MO17','BLUE'][[1]]),
+                         Rs_M = cor(phenotype_pred[test_pheno$pollen_parent == 'MO17'],
+                                    test_pheno[test_pheno$pollen_parent == 'MO17','BLUE'],
+                                    method = 'spearman'),
+                         RMSE_B = RMSE(phenotype_pred[test_pheno$pollen_parent == 'B73'],
+                                     test_pheno[test_pheno$pollen_parent == 'B73','BLUE'][[1]]),
+                         Rs_B = cor(phenotype_pred[test_pheno$pollen_parent == 'B73'],
+                                    test_pheno[test_pheno$pollen_parent == 'B73','BLUE'],
+                                    method = 'spearman')))
+    }
+  }
+}
+
+prediction_correlation_plot = prediction_storage %>%
+  group_by(Year, Genotype) %>%
+  summarise(Prediction = mean(Prediction)) %>%
+  mutate(Year = as.numeric(str_remove(Year, 'x'))) %>%
+  pivot_wider(id_cols = Genotype,
+              names_from = Year,
+              values_from = Prediction,
+              names_prefix = 'GP_') %>%
+  left_join(hybrid_phenotype_data_2022 %>%
+              select(Genotype, BLUE),
+            by = c('Genotype')) %>%
+  rename(BLUE_2022 = BLUE) %>%
+  left_join(hybrid_phenotype_data_2023 %>%
+              select(Genotype, BLUE),
+            by = c('Genotype')) %>%
+  rename(BLUE_2023 = BLUE) %>%
+  pivot_longer(cols = -Genotype,
+               names_to = 'Type_Year',
+               values_to = 'Value') %>%
+  separate(Type_Year, into = c('Type', 'Year'), sep = '_') %>%
+  pivot_wider(id_cols = c(Genotype, Year),
+              names_from = Type,
+              values_from = Value) %>%
+  mutate(pollen_parent = case_when(str_detect(Genotype, ' X MO17') ~ 'MO17',
+                                   str_detect(Genotype, ' X B73') ~ 'B73')) %>%
+  ggplot(aes(x = GP, y = BLUE, color = pollen_parent))+
+  geom_abline(color = 'gray', linetype = 'dashed')+
+  geom_point(show.legend = F)+
+  geom_smooth(method = 'lm', se = F, show.legend = F)+
+  stat_cor(label.y = c(0.42, 0.41),
+           label.x = 0.44,
+           aes(label = ..r.label..),
+           show.legend = F,
+           r.digits = 3)+
+  geom_smooth(method = 'lm', se = F, color = 'darkorange')+
+  stat_cor(color = 'darkorange',
+           label.y = 0.40,
+           label.x = 0.44,
+           aes(label = ..r.label..),
+           show.legend = F,
+           r.digits = 3)+
+  scale_color_manual(values = c('MO17' = 'darkviolet', 'B73' = 'darkgreen'))+
+  labs(x = 'Genomic Predicted BLUE',
+       y = 'Observed BLUE',
+       tag = 'A')+
+  facet_wrap(~Year, ncol = 1)+
+  theme_classic()+
+  theme(text = element_text(size = 12, color = 'black'))
+
+prediction_correlation_plot
+
+ggsave('../Outputs/gp_correlation_plot.png', prediction_correlation_plot, device = 'png', width = 3.75, height = 4.5, units = 'in')
+
+t.test(gp_outcomes_cv1$Rs_M[gp_outcomes_cv1$Year ==2022], gp_outcomes_cv1$Rs_B[gp_outcomes_cv1$Year ==2022], paired = T)
+t.test(gp_outcomes_cv1$Rs_M[gp_outcomes_cv1$Year ==2023], gp_outcomes_cv1$Rs_B[gp_outcomes_cv1$Year ==2023], paired = T)
+
+gp_plot_cv1 = gp_outcomes_cv1 %>%
+  pivot_longer(cols = c(RMSE, Rs, RMSE_M, Rs_M, RMSE_B, Rs_B),
+               names_to = 'Metric',
+               values_to = 'Performance') %>%
+  mutate(Group = case_when(Metric == 'RMSE' ~ 'Overall',
+                            Metric == 'Rs' ~ 'Overall',
+                            Metric == 'RMSE_M' ~ 'Mo17',
+                            Metric == 'Rs_M' ~ 'Mo17',
+                            Metric == 'RMSE_B' ~ 'B73',
+                            Metric == 'Rs_B' ~ 'B73'),
+         Metric = case_when(Metric == 'RMSE' ~ 'RMSE',
+                            Metric == 'Rs' ~ 'Spearman R',
+                            Metric == 'RMSE_M' ~ 'RMSE',
+                            Metric == 'Rs_M' ~ 'Spearman R',
+                            Metric == 'RMSE_B' ~ 'RMSE',
+                            Metric == 'Rs_B' ~ 'Spearman R'),
+         Metric = factor(Metric, levels = c('Spearman R', 'RMSE'))) %>%
+  ggplot(aes(x = Performance, fill = Group))+
+  geom_density(alpha = 0.5)+
+  scale_fill_manual(values = c('B73' = 'darkgreen', 'Mo17' = 'darkviolet', 'Overall' = 'darkorange'))+
+  #xlim(-1,1)+
+  facet_wrap(Year~Metric,
+             scales = 'free')+
+  labs(x = NULL,
+       fill = NULL,
+       tag = 'B')+
+  theme_classic()+
+  theme(text = element_text(size = 12, color = 'black'),
+        legend.position = 'bottom',
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  guides(fill = guide_legend(override.aes = list(alpha = 1)))
+
+gp_plot_cv1
+
+ggsave('../Outputs/gp_plot_cv1.png', gp_plot_cv1, device = 'png', width = 3.75, height = 4.5, units = 'in')
+
+gp_outcomes_cv1 %>%
+  pivot_longer(cols = c(RMSE, Rs, RMSE_M, Rs_M, RMSE_B, Rs_B),
+               names_to = 'Metric',
+               values_to = 'Performance') %>%
+  mutate(Group = case_when(Metric == 'RMSE' ~ 'Overall',
+                            Metric == 'Rs' ~ 'Overall',
+                            Metric == 'RMSE_M' ~ 'Mo17',
+                            Metric == 'Rs_M' ~ 'Mo17',
+                            Metric == 'RMSE_B' ~ 'B73',
+                            Metric == 'Rs_B' ~ 'B73'),
+         Metric = case_when(Metric == 'RMSE' ~ 'RMSE',
+                            Metric == 'Rs' ~ 'Spearman R',
+                            Metric == 'RMSE_M' ~ 'RMSE',
+                            Metric == 'Rs_M' ~ 'Spearman R',
+                            Metric == 'RMSE_B' ~ 'RMSE',
+                            Metric == 'Rs_B' ~ 'Spearman R')) %>%
+  group_by(Metric, Year, Group) %>%
+  summarise(mean = mean(Performance),
+            cv = sd(Performance) / mean(Performance),
+            min = min(Performance),
+            max = max(Performance)) %>%
+  ungroup() %>%
+  pivot_longer(cols = -c(Metric, Year, Group),
+               names_to = 'Stat',
+               values_to = 'Value') %>%
+  mutate(group = paste(Year, Group, sep = '_')) %>%
+  pivot_wider(id_cols = c(Metric, Stat),
+              names_from = group,
+              values_from = Value) %>%
+  write_csv('../Outputs/gp_outcomes_cv1.csv')
+```
+
+# Plot out the weather data for 2022 and 2023 compared to the other weather from 2000 to 2024
+```{r read in and plot the weather data}
+precip = readxl::read_xlsx('../Data/Weather_Data_Precipitation.xlsx')
+temp = readxl::read_xlsx('../Data/Weather_Data_Avg_Temp.xlsx')
+
+precip %>%
+  select(-Annual) %>%
+  pivot_longer(cols = -Year,
+               names_to = 'Month',
+               values_to = 'Climate_Value') %>%
+  mutate(Factor = 'Precipitation') %>%
+  bind_rows(temp %>%
+              select(-Annual) %>%
+  pivot_longer(cols = -Year,
+               names_to = 'Month',
+               values_to = 'Climate_Value') %>%
+              mutate(Factor = 'Temperature')) %>%
+  mutate(Month = factor(Month, levels = c('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')),
+         Year = case_when(Year %in% c(2022, 2023) ~ as.character(Year),
+                          T ~ 'Non-Experimental Year')) %>%
+  arrange(desc(Year)) %>%
+  ggplot(aes(x = Month, y = Climate_Value, color = Year))+
+  geom_vline(xintercept = c('May','Oct'), linetype = 'dashed')+
+  geom_point()+
+  #geom_line(show.legend = F)+
+  scale_color_manual(values = c('Non-Experimental Year' = 'gray',
+                                '2022' = 'darkred',
+                                '2023' = 'darkblue'))+
+  facet_wrap(~Factor, scales = 'free_y')+
+  labs(x = 'Month of Year',
+       y = 'Climatic Value')+
+  theme_classic()+
+  theme(text = element_text(size = 12, color = 'black'),
+        legend.position = 'bottom')
+```
+
