@@ -13,3 +13,5 @@ The scripts contained in this repository were used to generate, visualize, and a
   * Hapmap_Filtering.py was used to reduce file size based on LD analysis and was eventually not used in analysis
   * Hapmap_Filtering_for_GP.sh was used to select markers based on GWAS markers selected by Selecting_GWAS_Markers.R
 * Hybrid_Hapmap_Builder.(R/sh) was used to construct the hapmap used for these analyses.
+* SNP_Marker_PVE.sh was used to determine the proportion of phenotypic variance explained by the hapmap markers.
+  * This code runs GWAS_PVE_Phenotype_Formatting.R which formats the phenotypic and genotypic data. 
