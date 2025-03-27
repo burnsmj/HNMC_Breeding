@@ -11,6 +11,8 @@ cd ~/HNMC_Breeding
 
 # create folder to keep files from GCTA analysis
 mkdir -p Analysis/gcta
+mkdir -p Analysis/gcta/WiDiv_2022
+mkdir -p Analysis/gcta/WiDiv_2023
 
 # adjust phenotype files to gcta format
 module load R/4.3.0-openblas-rocky8
@@ -51,6 +53,11 @@ cd gcta_v1.94.0Beta_linux_kernel_2_x86_64/
      --make-grm \
      --thread-num 10 \
      --out ../${FOLDER}/${PLK}
+     # calculate dominance genetic relationship matrix
+gcta --bfile ../${FOLDER}/${PLK} \
+     --make-grm-d \
+     --thread-num 10 \
+     --out ../${FOLDER}/${PLK}
 
 echo "Estimating variance explained by markers for different traits"
 
@@ -64,5 +71,10 @@ for trait in WiDiv_2022 WiDiv_2023; do
        --pheno ${PHENO} \
        --reml \
        --out ${OUT}.add \
+       --thread-num 10
+  gcta --grm ../${FOLDER}/${PLK}.d \
+       --pheno ${PHENO} \
+       --reml \
+       --out ${OUT}.dom \
        --thread-num 10
 done
