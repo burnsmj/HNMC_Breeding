@@ -1,1 +1,5 @@
 Files present here are used throughout analyses. In particular, these files are all read in by the Hybrid_NMC_Breeding.Rmd script.
+Note: File Paths in the script may not algin with your file structure, so please check to make sure they align.
+
+The original VCF is not uploadable to GitHub due to size restrictions. Instead, the Hapmap's that were created from the conversion are included 
+(widiv_snps.B73-alleles-only.txt, widiv_snps.Qiu-et-al.no-B73.hmp.txt) as a zipped file to reduce storage restrictions. Please unzip before processing. 
