@@ -1,8 +1,9 @@
 Files present here are used throughout analyses. In particular, these files are all read in by the Hybrid_NMC_Breeding.Rmd script.
 Note: File Paths in the script may not algin with your file structure, so please check to make sure they align.
 
-The original VCF is not uploadable to GitHub due to size restrictions. Instead, the Hapmap's that were created from the conversion are included 
-(widiv_snps.B73-alleles-only.txt, widiv_snps.Qiu-et-al.no-B73.hmp.txt) as a zipped file to reduce storage restrictions. Please unzip before processing. 
+The original VCF is not uploadable to GitHub due to size restrictions, and the hapmaps created from it are similarly too large to upload.
+Instead, please find the sequence data at BioProject PRJNA661271, Supplementary Table S1. Scripts to convert from VCF to Hapmap are provided
+in the scripts folder of this repository.
 
 Files:
 - 2022_2023_field_planning_widiv_xref.csv
